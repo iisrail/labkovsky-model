@@ -4,9 +4,15 @@ venv/
 # Audio files (large)
 audio/
 
+# Vector store
+chroma_db/
+
 # Python cache
 __pycache__/
 *.pyc
+
+# Models cache (если используешь)
+models/
 
 # OS files
 .DS_Store
