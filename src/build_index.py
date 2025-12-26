@@ -113,12 +113,13 @@ def prepare_documents():
                 question = record.get("question", "")
                 answer = record.get("answer", "")
                 text = f"Вопрос: {question} Ответ: {answer}"
-                
+               
                 metadata = {
                     "source": "qa",
                     "video_id": record.get("video_id", ""),
                     "video_title": record.get("video_title", ""),
-                    "question": question
+                    "question": question,
+                    "id": record.get("id", "")
                 }
             
             # Для e5 моделей нужен префикс "passage:"

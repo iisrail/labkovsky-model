@@ -25,7 +25,7 @@ import ollama
 # ============================================================
 
 SCRIPT_DIR = Path(__file__).parent
-CHROMA_DIR = SCRIPT_DIR / "chroma_db"
+CHROMA_DIR = SCRIPT_DIR.parent / "chroma_db"
 
 # Embedding модель (та же что при индексации!)
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
@@ -195,10 +195,19 @@ def ask_labkovsky(query: str, top_k: int = TOP_K, verbose: bool = False) -> str:
     if verbose:
         print("\n📚 Найденные документы:")
         for i, doc in enumerate(docs, 1):
-            source = doc['metadata'].get('source', '?')
+            meta = doc['metadata']
+            source = meta['source']
             dist = doc['distance']
-            preview = doc['text'][:100] + "..."
-            print(f"  [{i}] ({source}, dist={dist:.3f}) {preview}")
+
+            # Build display ID based on source
+            if source == 'qa':
+                display_id = meta.get('id', '?')
+            elif source == 'article':
+                display_id = f"{meta.get('article_id', '?')[:20]}..._chunk{meta.get('chunk_id')}"
+            elif source == 'interview':
+                display_id = f"int_chunk{meta.get('chunk_id')}"            
+            preview = doc['text'][:80] + "..."
+            print(f"  [{i}] ({source}, {display_id}, dist={dist:.3f}) {preview}")
         print()
     
     # Generation
