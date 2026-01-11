@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Fine-tune Qwen2.5-7B on Labkovsky Q&A data using transformers + peft.
+Fine-tune Qwen2.5-7B on Labkovsky Q&A data with RS conditioning.
 
-Features:
-- Combined data: QA + multi-turn dialogues (same messages format)
-- 85/15 train/validation split
-- Monitors validation loss to detect overfitting
+Architecture:
+- No system prompt
+- RS prefix as behavioral signal
+- Pure Q&A data (no RAG context in training)
 
-Requirements:
-    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-    pip install transformers peft trl accelerate bitsandbytes datasets
+Format:
+<RS=INTERVENTION>
+Вопрос: ...
+Ответ: ...
 
 Usage:
     python train_lora.py
 """
-import random
+
 import json
+import random
+import sys
 import torch
+import gc
 from functools import partial
 from pathlib import Path
 from datasets import Dataset
@@ -28,106 +32,131 @@ from transformers import (
     EarlyStoppingCallback
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer, SFTConfig
+from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import (
+    FINE_TUNING_DATA_DIR,
+    MODEL_NAME,
+    LORA_PATH,
+    RS_TOKENS,
+)
 
 # ==============================================================
 # SETTINGS
 # ==============================================================
 
-# Data paths
-SCRIPT_DIR = Path(__file__).parent
-DATA_DIR = SCRIPT_DIR / "data"
-QA_PATH = DATA_DIR / "train_data_clean.jsonl"
-DIALOGUES_PATH = DATA_DIR / "Hochu_i_budu_dialogues.jsonl"
-
-# Train/validation split
-VAL_RATIO = 0.15 # 15% for validation
-RANDOM_SEED = 42
-
-# Model
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+# Paths (using config)
+INPUT_DATA = FINE_TUNING_DATA_DIR / "qa_rs_corpus_clean.jsonl"
+FORMATTED_DATA = FINE_TUNING_DATA_DIR / "train_rs_formatted.jsonl"
+OUTPUT_DIR = LORA_PATH
 
 # LoRA settings
-LORA_R = 8
-LORA_ALPHA = 16
-LORA_DROPOUT = 0.1
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05  # Lower dropout to preserve rare patterns (stories, idioms)
 
 # Training settings
 MAX_SEQ_LENGTH = 1024
-BATCH_SIZE = 1           # Small for 12GB VRAM
+BATCH_SIZE = 1
 GRADIENT_ACCUMULATION = 4
-LEARNING_RATE = 1e-5
+LEARNING_RATE = 2e-5  # Higher LR for small dataset with LoRA
 NUM_EPOCHS = 10
 WARMUP_STEPS = 10
-
-# Output
-OUTPUT_DIR = SCRIPT_DIR.parent.parent / "models" / "labkovsky-qwen7b-lora"
+VAL_RATIO = 0.15
+RANDOM_SEED = 42
 
 # ==============================================================
-# LOAD DATA
+# STEP 1: CREATE FORMATTED TRAINING DATA
 # ==============================================================
 
-def load_all_data(qa_path: Path, dialogues_path: Path) -> list:
+def create_formatted_data(input_path: Path, output_path: Path) -> int:
     """
-    Load all data into unified messages format.
+    Convert qa_rs_corpus_clean.jsonl to prompt/completion format.
+    
+    Input format:
+    {"question": "...", "answer": "...", "response_signal": "INTERVENTION"}
+    
+    Output format:
+    {"prompt": "<RS=INTERVENTION>\nВопрос: ...\nОтвет:", "completion": "..."}
     """
-    all_records = []
-
-    # Load QA (input/output format → messages)
-    qa_count = 0
-    with open(qa_path, 'r', encoding='utf-8') as f:
+    print(f"\n📄 Creating formatted training data...")
+    print(f"   Input:  {input_path}")
+    print(f"   Output: {output_path}")
+    
+    records = []
+    rs_counts = {}
+    
+    with open(input_path, 'r', encoding='utf-8') as f:
         for line in f:
             if line.strip():
-                r = json.loads(line)
-                all_records.append({
-                    "messages": [
-                        {"role": "user", "content": r["input"]},
-                        {"role": "assistant", "content": r["output"]}
-                    ],
-                    "source": "qa"
+                data = json.loads(line)
+                
+                question = data["question"]
+                answer = data["answer"]
+                rs = data["response_signal"]
+                
+                # Count RS distribution
+                rs_counts[rs] = rs_counts.get(rs, 0) + 1
+                
+                # Format prompt
+                prompt = f"<RS={rs}>\nВопрос: {question}\nОтвет:"
+                completion = answer
+                
+                records.append({
+                    "prompt": prompt,
+                    "completion": completion
                 })
-                qa_count += 1
+    
+    # Save formatted data
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+    
+    print(f"   ✅ Created {len(records)} formatted examples")
+    print(f"   RS distribution:")
+    for rs, count in sorted(rs_counts.items()):
+        print(f"      {rs}: {count}")
+    
+    return len(records)
 
-    # Load dialogues (turns → messages)
-    dialogue_count = 0
-    with open(dialogues_path, 'r', encoding='utf-8') as f:
+
+# ==============================================================
+# STEP 2: LOAD DATA FOR TRAINING
+# ==============================================================
+
+def load_training_data(data_path: Path) -> list:
+    """Load formatted prompt/completion data."""
+    records = []
+    
+    with open(data_path, 'r', encoding='utf-8') as f:
         for line in f:
             if line.strip():
-                r = json.loads(line)
-                all_records.append({
-                    "messages": r["turns"],
-                    "source": "dialogue"
-                })
-                dialogue_count += 1
-
-    print(f"📄 Loaded: {qa_count} QA + {dialogue_count} dialogues = {len(all_records)} total")
-
-    return all_records
+                records.append(json.loads(line))
+    
+    return records
 
 
-# ==============================================================
-# FORMAT FOR CHAT
-# ==============================================================
-
-def format_prompts(examples, tokenizer):
-    """Format examples using Qwen chat template"""
+def format_for_sft(examples, tokenizer):
+    """
+    Combine prompt + completion into single text for SFT.
+    
+    Loss is computed only on tokens AFTER "Ответ:" delimiter
+    (handled by DataCollatorForCompletionOnlyLM).
+    """
     texts = []
-
-    for i in range(len(examples["messages"])):
-        messages = examples["messages"][i]
-
-        # Add Labkovsky system prompt
-        messages_with_system = [
-            {"role": "system", "content": "Ты — Михаил Лабковский, российский психолог."}
-        ] + messages
-
-        text = tokenizer.apply_chat_template(
-            messages_with_system,
-            tokenize=False,
-            add_generation_prompt=False
-        )
+    eos = tokenizer.eos_token
+    
+    for i in range(len(examples["prompt"])):
+        prompt = examples["prompt"][i]
+        completion = examples["completion"][i]
+        
+        # Full text: prompt + space + completion + EOS
+        # Collator will mask everything up to and including "Ответ:"
+        text = f"{prompt} {completion}{eos}"
         texts.append(text)
-
+    
     return {"text": texts}
 
 
@@ -136,35 +165,66 @@ def format_prompts(examples, tokenizer):
 # ==============================================================
 
 def main():
-    import gc
     torch.cuda.empty_cache()
     gc.collect()
     
     print("=" * 60)
-    print("Labkovsky Fine-tuning with transformers + peft")
-    print("With train/validation split")
+    print("Labkovsky Fine-tuning with RS Conditioning")
+    print("No system prompt, pure behavioral learning")
     print("=" * 60)
- 
+    
     # Check CUDA
     if not torch.cuda.is_available():
-        print("❌ CUDA not available! Training will be very slow.")
+        print("❌ CUDA not available!")
         return
     
     print(f"✅ CUDA: {torch.cuda.get_device_name(0)}")
     print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     
-    # 1. Setup quantization (4-bit to fit in 12GB VRAM)
+    # Check bf16 support (Ampere+ GPUs)
+    bf16_supported = torch.cuda.is_bf16_supported()
+    print(f"   BF16: {'supported' if bf16_supported else 'NOT supported (will use fp32)'}")
+    
+    # Set compute dtype based on GPU capability
+    if bf16_supported:
+        compute_dtype = torch.bfloat16
+        use_bf16 = True
+    else:
+        compute_dtype = torch.float16
+        use_bf16 = False
+    
+    # Step 1: Create formatted data
+    create_formatted_data(INPUT_DATA, FORMATTED_DATA)
+    
+    # Step 2: Load and prepare data
+    print(f"\n📚 Loading training data...")
+    records = load_training_data(FORMATTED_DATA)
+    
+    random.seed(RANDOM_SEED)
+    random.shuffle(records)
+    
+    dataset = Dataset.from_list(records)
+    
+    # Split train/validation
+    print(f"\n📊 Splitting data: {int((1-VAL_RATIO)*100)}% train / {int(VAL_RATIO*100)}% validation")
+    split = dataset.train_test_split(test_size=VAL_RATIO, seed=RANDOM_SEED)
+    train_dataset = split["train"]
+    eval_dataset = split["test"]
+    
+    print(f"   Train: {len(train_dataset)}")
+    print(f"   Eval:  {len(eval_dataset)}")
+    
+    # Step 3: Setup quantization
     print(f"\n🔧 Setting up 4-bit quantization...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=True,
     )
     
-    # 2. Load model
+    # Step 4: Load model
     print(f"\n🤖 Loading model: {MODEL_NAME}")
-    print("   (This may take a few minutes on first run)")
     
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -180,11 +240,22 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     
-    # 3. Prepare for training
+    # Add RS tags as special tokens (atomic, not split into subwords)
+    num_added = tokenizer.add_special_tokens({
+        "additional_special_tokens": RS_TOKENS
+    })
+    print(f"   Added {num_added} special RS tokens: {RS_TOKENS}")
+    
+    # Resize embeddings to accommodate new tokens
+    model.resize_token_embeddings(len(tokenizer))
+    print(f"   Resized embeddings to {len(tokenizer)} tokens")
+    
+    # Step 5: Prepare for k-bit training
     print(f"\n🔧 Preparing model for k-bit training...")
     model = prepare_model_for_kbit_training(model)
     
-    # 4. Add LoRA adapters
+    # Step 6: Add LoRA adapters
+    # Note: embed_tokens in modules_to_save (not LoRA) so new RS tokens get real embeddings
     print(f"\n🔧 Adding LoRA adapters (r={LORA_R}, alpha={LORA_ALPHA})")
     lora_config = LoraConfig(
         r=LORA_R,
@@ -196,48 +267,36 @@ def main():
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
+        modules_to_save=["embed_tokens"],  # Save full embeddings (for new RS tokens)
     )
     
     model = get_peft_model(model, lora_config)
     model.gradient_checkpointing_enable()
     model.print_trainable_parameters()
     
-    # 5. Load all data
-    print(f"\n📚 Loading training data...")
-    all_records = load_all_data(QA_PATH, DIALOGUES_PATH)
+    # Step 7: Format data for SFT
+    print(f"\n📝 Formatting data for training...")
+    print(f"   EOS token: {repr(tokenizer.eos_token)}")
     
-    random.seed(RANDOM_SEED)
-    random.shuffle(all_records)
-
-    # Create dataset
-    dataset = Dataset.from_list(all_records)
-    
-    # 6. Split into train/validation
-    print(f"\n📊 Splitting data: {int((1-VAL_RATIO)*100)}% train / {int(VAL_RATIO*100)}% validation")
-    split = dataset.train_test_split(test_size=VAL_RATIO, seed=RANDOM_SEED)
-    train_dataset = split["train"]
-    eval_dataset = split["test"]
-    
-    # Show split stats
-    train_qa = sum(1 for x in train_dataset if x["source"] == "qa")
-    train_dialogue = sum(1 for x in train_dataset if x["source"] == "dialogue")
-    eval_qa = sum(1 for x in eval_dataset if x["source"] == "qa")
-    eval_dialogue = sum(1 for x in eval_dataset if x["source"] == "dialogue")
-
-    print(f"   Train: {len(train_dataset)} total ({train_qa} QA + {train_dialogue} dialogues)")
-    print(f"   Eval:  {len(eval_dataset)} total ({eval_qa} QA + {eval_dialogue} dialogues)")
-    
-    # 7. Format for chat template
-    print(f"\n📝 Formatting data...")
-    format_fn = partial(format_prompts, tokenizer=tokenizer)
+    format_fn = partial(format_for_sft, tokenizer=tokenizer)
     train_dataset = train_dataset.map(format_fn, batched=True)
     eval_dataset = eval_dataset.map(format_fn, batched=True)
     
     print(f"\n📝 Sample formatted text:")
-    print(f"{train_dataset[0]['text'][:300]}...")
+    print("-" * 40)
+    print(train_dataset[0]['text'][:500])
+    print("-" * 40)
     
-    # 8. Setup trainer
-    print(f"\n🏋️ Setting up trainer")
+    # Step 8: Setup trainer with completion-only loss
+    print(f"\n🏋️ Setting up trainer...")
+    print(f"   Using completion-only loss (masking prompt tokens)")
+    
+    # Response template - loss computed only AFTER this delimiter
+    response_template = "Ответ:"
+    collator = DataCollatorForCompletionOnlyLM(
+        response_template=response_template,
+        tokenizer=tokenizer,
+    )
     
     sft_config = SFTConfig(
         output_dir=str(OUTPUT_DIR),
@@ -246,14 +305,14 @@ def main():
         warmup_steps=WARMUP_STEPS,
         num_train_epochs=NUM_EPOCHS,
         learning_rate=LEARNING_RATE,
-        fp16=False,
-        bf16=False,
+        fp16=not use_bf16 and torch.cuda.is_available(),  # Use fp16 if bf16 not supported
+        bf16=use_bf16,  # Match bnb_4bit_compute_dtype
         logging_steps=20,
-        eval_strategy="epoch",  # Evaluate after each epoch
+        eval_strategy="epoch",
         save_strategy="epoch",
-        load_best_model_at_end=True,  # Load best model based on eval loss
+        load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
-        greater_is_better=False,  # Lower eval_loss is better
+        greater_is_better=False,
         optim="paged_adamw_8bit",
         seed=RANDOM_SEED,
         report_to="none",
@@ -267,33 +326,37 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=sft_config,
+        data_collator=collator,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
     )
     
-    # 9. Train!
+    # Step 9: Train
     print(f"\n🚀 Starting training...")
     print(f"   Epochs: {NUM_EPOCHS}")
     print(f"   Effective batch: {BATCH_SIZE} x {GRADIENT_ACCUMULATION} = {BATCH_SIZE * GRADIENT_ACCUMULATION}")
     print(f"   Learning rate: {LEARNING_RATE}")
+    print(f"   LoRA r: {LORA_R}, alpha: {LORA_ALPHA}")
     print(f"   Train examples: {len(train_dataset)}")
     print(f"   Eval examples: {len(eval_dataset)}")
     
     trainer.train()
     
-    # 10. Show final metrics
+    # Step 10: Final evaluation
     print(f"\n📊 Final evaluation...")
     final_metrics = trainer.evaluate()
     print(f"   Final eval_loss: {final_metrics['eval_loss']:.4f}")
     
-    # 11. Save best model
+    # Step 11: Save
     print(f"\n💾 Saving LoRA adapter to {OUTPUT_DIR}")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     trainer.save_model(OUTPUT_DIR)
     tokenizer.save_pretrained(OUTPUT_DIR)
     
-    print("\n✅ Training complete!")
+    print("\n" + "=" * 60)
+    print("✅ Training complete!")
     print(f"   Model saved to: {OUTPUT_DIR}")
-    print(f"   Best model selected based on lowest eval_loss")
+    print(f"   Format: <RS=...>\\nВопрос: ...\\nОтвет: ...")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

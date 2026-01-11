@@ -1,10 +1,12 @@
+import sys
+from pathlib import Path
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
-from config import MODELS_DIR
 
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-LORA_PATH = MODELS_DIR / "labkovsky-qwen7b-lora"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import MODEL_NAME, LORA_PATH, TEMPERATURE, MAX_NEW_TOKENS
 
 def load_model():
     print("🤖 Loading model...")
@@ -41,9 +43,9 @@ def ask(model, tokenizer, question):
     
     with torch.no_grad():
         outputs = model.generate(
-            inputs,                          # Just pass tensor directly, no **
-            max_new_tokens=512,
-            temperature=0.7,
+            inputs,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
             do_sample=True,
             pad_token_id=tokenizer.eos_token_id,
         )
