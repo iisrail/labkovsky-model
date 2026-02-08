@@ -1,222 +1,220 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RAG Pipeline - Query (with Fine-tuned Model)
-Поиск релевантных чанков + генерация ответа через fine-tuned Qwen2.5 + LoRA
+RAG Pipeline using Vikhr-YandexGPT
 
-Использование:
-1. Сначала запусти build_index.py
-2. python query_rag.py
+Flow:
+1. Retrieve relevant chunks from ChromaDB (grouped by qa_id)
+2. Derive RS (Response Signal) from best matching chunk
+3. Generate response using Vikhr's RAG format (documents role)
 
-Или импортируй как модуль:
-    from query_rag import ask_labkovsky
-    answer = ask_labkovsky("Как полюбить себя?")
+RS guides response composition:
+- EXPLANATION: explain why this happens
+- INTERVENTION: give direct action advice
+- ESCALATION: recommend professional help
+
+Usage:
+    python query_rag.py
 """
 
 import argparse
+import json
 import torch
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 import chromadb
-from config import CHROMA_DIR, MODELS_DIR
 
 # ============================================================
-# НАСТРОЙКИ
+# PATHS (adjust to your setup)
 # ============================================================
 
-# Embedding модель (та же что при индексации!)
+SCRIPT_DIR = Path(__file__).parent
+PROJECT_DIR = SCRIPT_DIR.parent.parent  # Go up to project root
+CHROMA_DIR = PROJECT_DIR / "chroma_db"
+MODELS_DIR = PROJECT_DIR / "models"
+
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-
-# Fine-tuned LLM
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-LORA_PATH = MODELS_DIR / "labkovsky-qwen7b-lora"
-
-# Сколько чанков искать
-TOP_K = 5
-
-# Prompt modes: "full", "minimal", "none"
-PROMPT_MODE = "full"
-
-SYSTEM_PROMPTS = {
-    "full": """Ты — Михаил Лабковский, известный российский психолог.
-
-Твой стиль:
-- Прямой, без воды
-- С юмором и иронией
-- Иногда провокационный
-- Говоришь простым языком, без научных терминов
-- Часто используешь примеры из жизни
-- Твоя главная идея: психические проблемы формируются из-за закреплённых поведенческих реакций, и избавиться от них можно, системно применяя 6 правил.
-
-Отвечай на вопросы используя контекст ниже.""",
-
-    "minimal": """Ты — Михаил Лабковский, психолог. Отвечай используя контекст ниже.""",
-
-    "none": None
-}
+LLM_MODEL_NAME = "Vikhrmodels/Vikhr-YandexGPT-5-Lite-8B-it"  # Russian-native, RAG-trained
+LORA_PATH = MODELS_DIR / "labkovsky-vikhr-yandex-lora"
 
 # ============================================================
-# ИНИЦИАЛИЗАЦИЯ
+# GLOBAL STATE
 # ============================================================
 
-# Глобальные переменные для кэширования
 _embed_model = None
 _collection = None
 _llm = None
 _tokenizer = None
 
-
-def init_retrieval():
-    """Инициализация embedding модели и ChromaDB"""
-    global _embed_model, _collection
-    
+def init_embedding():
+    global _embed_model
     if _embed_model is None:
-        print("🤖 Загрузка embedding модели...")
+        print("[+] Loading embedding model...")
         _embed_model = SentenceTransformer(EMBEDDING_MODEL)
-    
+    return _embed_model
+
+def init_retrieval(chroma_dir: Path):
+    global _collection
     if _collection is None:
-        print("💾 Подключение к ChromaDB...")
-        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        print("[+] Connecting to ChromaDB...")
+        client = chromadb.PersistentClient(path=str(chroma_dir))
         _collection = client.get_collection("labkovsky")
-        print(f"✅ Загружено {_collection.count()} документов")
-    
-    return _embed_model, _collection
+        print(f"   Loaded {_collection.count()} documents")
+    return _collection
 
-
-def init_llm(use_lora: bool = True):
-    """Инициализация fine-tuned LLM с LoRA"""
+def init_llm(use_lora: bool = True, lora_path: Path = None):
     global _llm, _tokenizer
-    
     if _llm is None:
-        print(f"🤖 Загрузка LLM: {MODEL_NAME}")
+        print(f"[+] Loading LLM: {LLM_MODEL_NAME}")
 
-        
-        # 4-bit quantization for 12GB VRAM
+        # Load tokenizer first - from LoRA dir if using LoRA (has added tokens)
+        if use_lora and lora_path and lora_path.exists():
+            print(f"   Loading tokenizer from LoRA: {lora_path}")
+            _tokenizer = AutoTokenizer.from_pretrained(str(lora_path), trust_remote_code=True)
+        else:
+            _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME, trust_remote_code=True)
+
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
         )
-        
-        # Load base model
+
         base_model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
+            LLM_MODEL_NAME,
             quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
         )
-        if use_lora:
-            print(f"   LoRA: {LORA_PATH}")
-            _llm = PeftModel.from_pretrained(base_model, str(LORA_PATH))
+
+        if use_lora and lora_path and lora_path.exists():
+            # Resize embeddings to match LoRA tokenizer vocab
+            print(f"   Resizing embeddings: {base_model.get_input_embeddings().weight.shape[0]} -> {len(_tokenizer)}")
+            base_model.resize_token_embeddings(len(_tokenizer))
+            print(f"   Loading LoRA: {lora_path}")
+            _llm = PeftModel.from_pretrained(base_model, str(lora_path))
         else:
             print("   (base model, no LoRA)")
             _llm = base_model
-        # Load LoRA adapter
-        
+
         _llm.eval()
-        
-        # Load tokenizer
-        _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-        
-        print("✅ LLM загружен")
-    
+        print(f"[OK] LLM loaded ({'with LoRA' if use_lora and lora_path and lora_path.exists() else 'base only'})")
+
     return _llm, _tokenizer
-
-
-def init(use_lora: bool = True):
-    """Инициализация всех компонентов"""
-    init_retrieval()
-    init_llm(use_lora)
-
 
 # ============================================================
 # RETRIEVAL
 # ============================================================
 
-def retrieve(query: str, top_k: int = TOP_K) -> list:
+def retrieve_grouped(query: str) -> list:
     """
-    Поиск релевантных документов
-    
-    Args:
-        query: Вопрос пользователя
-        top_k: Сколько документов вернуть
-    
-    Returns:
-        Список документов с метаданными
+    Retrieve all chunks from the same Q&A pair as best match.
+    Orders chunks: EXPLANATION → INTERVENTION → ESCALATION (each optional)
     """
-    embed_model, collection = init_retrieval()
-    
-    # Для e5 моделей нужен префикс "query:"
+    embed_model = init_embedding()
+    collection = _collection
+
     query_embedding = embed_model.encode(f"query: {query}")
-    
-    # Поиск в ChromaDB
+
+    # Step 1: Find best matching chunk
     results = collection.query(
         query_embeddings=[query_embedding.tolist()],
-        n_results=top_k,
-        include=["documents", "metadatas", "distances"]
+        n_results=1,
+        include=["metadatas", "distances"]
     )
-    
-    # Форматируем результаты
-    documents = []
-    for i in range(len(results['ids'][0])):
-        documents.append({
-            "text": results['documents'][0][i],
-            "metadata": results['metadatas'][0][i],
-            "distance": results['distances'][0][i]
-        })
-    
-    return documents
 
+    if not results['ids'][0]:
+        return []
+
+    best_id = results['ids'][0][0]  # e.g., "srJvn19GKNA_01_expl"
+    best_distance = results['distances'][0][0]
+
+    # Step 2: Extract qa_id and get all chunks with same qa_id
+    qa_id = best_id.rsplit("_", 1)[0]  # "srJvn19GKNA_01"
+
+    group = collection.get(
+        where={"qa_id": qa_id},
+        include=["documents", "metadatas"]
+    )
+
+    # Step 3: Organize by RS type
+    chunks_by_rs = {}
+    for doc_id, doc, meta in zip(group["ids"], group["documents"], group["metadatas"]):
+        suffix = doc_id.rsplit("_", 1)[-1]  # "expl", "interv", "escal"
+        chunks_by_rs[suffix] = {
+            "text": doc,
+            "metadata": meta,
+            "distance": best_distance if doc_id == best_id else None
+        }
+
+    # Step 4: Return in order: EXPLANATION → INTERVENTION → ESCALATION
+    documents = []
+    for suffix in ["expl", "interv", "escal"]:
+        if suffix in chunks_by_rs:
+            documents.append(chunks_by_rs[suffix])
+
+    return documents
 
 # ============================================================
 # GENERATION
 # ============================================================
 
-def generate(query: str, context_docs: list, prompt_mode: str = None) -> str:
-    if prompt_mode is None:
-        prompt_mode = PROMPT_MODE
+# Base system prompt (Vikhr recommendation for grounded RAG)
+# Style comes from LoRA fine-tuning
+BASE_SYSTEM_PROMPT = """Answer the user's question using only the information from the provided documents. Answer in Russian. Do not add information not present in documents."""
 
-    llm, tokenizer = init_llm()
+# RS-specific composition instructions
+RS_INSTRUCTIONS = {
+    "EXPLANATION": "Focus on explaining WHY this happens. Help the user understand the cause. Don't push or command.",
+    "INTERVENTION": "Give a direct instruction: what to do or stop doing. Be concrete and actionable.",
+    "ESCALATION": "Recommend professional help. Don't try to solve this yourself, explain why a specialist is needed.",
+}
 
-    # ---- Формируем контекст ----
-    context_parts = []
-    for i, doc in enumerate(context_docs, 1):
-        source = doc['metadata'].get('source', 'unknown')
-        if source == 'qa':
-            context_parts.append(f"[{i}] {doc['text']}")
-        else:
-            identifier = (
-                doc['metadata'].get('article_id')
-                or doc['metadata'].get('interview_id')
-                or doc['metadata'].get('book_id')
-                or doc['metadata'].get('chapter_id')
-                or ''
-            )
-            context_parts.append(f"[{i}] ({identifier}) {doc['text']}")
 
-    context = "\n\n".join(context_parts)
+def generate(query: str, context_docs: list) -> str:
+    """
+    Generate response using Vikhr's RAG format with documents role.
+    RS instruction is derived from the retrieved chunks.
 
-    user_message = f"""Контекст из моих материалов:
+    Args:
+        query: User question
+        context_docs: List of dicts with 'text' and 'metadata' keys
+    """
+    llm, tokenizer = _llm, _tokenizer
 
-{context}
+    # Format documents for Vikhr's documents role
+    documents = []
+    for i, doc in enumerate(context_docs):
+        rs_type = doc['metadata'].get('rs', f'Document {i}')
+        documents.append({
+            "doc_id": i,
+            "title": rs_type,
+            "content": doc['text']
+        })
 
----
+    # Determine RS from the best matching chunk (one with distance set)
+    rs = None
+    for doc in context_docs:
+        if doc.get("distance") is not None:
+            rs = doc['metadata'].get('rs')
+            break
 
-Вопрос: {query}"""
-
-    system_prompt = SYSTEM_PROMPTS.get(prompt_mode)
-
-    if system_prompt:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
+    # Build system prompt with RS instruction if available
+    if rs and rs in RS_INSTRUCTIONS:
+        system_prompt = f"{BASE_SYSTEM_PROMPT}\n\nComposition: {RS_INSTRUCTIONS[rs]}"
     else:
-        messages = [{"role": "user", "content": user_message}]
+        system_prompt = BASE_SYSTEM_PROMPT
 
-    # ---- ВАЖНО: tokenize=True ----
+    # Vikhr RAG format: system + documents role + user
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "documents", "content": json.dumps(documents, ensure_ascii=False)},
+        {"role": "user", "content": query},
+    ]
+
     inputs = tokenizer.apply_chat_template(
         messages,
         return_tensors="pt",
@@ -228,137 +226,117 @@ def generate(query: str, context_docs: list, prompt_mode: str = None) -> str:
     with torch.inference_mode():
         outputs = llm.generate(
             inputs,
-            max_new_tokens=1536,
-            temperature=None,
-            do_sample=False,
+            max_new_tokens=300,
+            do_sample=True,
+            temperature=0.3,  # Vikhr recommends 0.1-0.5
+            top_k=40,         # Vikhr recommends 30-50
+            repetition_penalty=1.1,
             pad_token_id=tokenizer.eos_token_id,
         )
 
-    # ---- КОРРЕКТНОЕ извлечение ответа ----
     generated_tokens = outputs[0][input_len:]
-    response = tokenizer.decode(
-        generated_tokens,
-        skip_special_tokens=True
-    ).strip()
+    response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
     return response
-
-
 
 # ============================================================
 # MAIN FUNCTION
 # ============================================================
 
-def ask_labkovsky(query: str, top_k: int = TOP_K, verbose: bool = False, prompt_mode: str = None) -> str:
-    """
-    Главная функция: задай вопрос — получи ответ от Лабковского
-    
-    Args:
-        query: Вопрос
-        top_k: Сколько документов использовать для контекста
-        verbose: Показывать найденные документы
-        prompt_mode: "full", "minimal", or "none"
-    
-    Returns:
-        Ответ в стиле Лабковского
-    """
-    # Retrieval
-    docs = retrieve(query, top_k)
-    
-    if verbose:
-        print("\n📚 Найденные документы:")
-        for i, doc in enumerate(docs, 1):
-            meta = doc['metadata']
-            source = meta.get('source', 'unknown')
-            dist = doc['distance']
+def ask_labkovsky(query: str) -> dict:
+    # Step 1: Retrieve all chunks for best matching Q&A pair
+    docs = retrieve_grouped(query)
 
-            # Build display ID based on source
-            if source == 'qa':
-                display_id = meta.get('id', '?')
-            elif source == 'article':
-                display_id = f"{meta.get('article_id', '?')[:20]}..._chunk{meta.get('chunk_id')}"
-            elif source == 'interview':
-                display_id = f"int_chunk{meta.get('chunk_id')}"
-            elif source == 'book':
-                display_id = f"{meta.get('book_id', '?')}_{meta.get('chapter_id', '?')}"
-            else:
-                display_id = '?'
-            
-            preview = doc['text'][:80] + "..."
-            print(f"  [{i}] ({source}, {display_id}, dist={dist:.3f}) {preview}")
-        print()
-    
-    # Generation
-    answer = generate(query, docs, prompt_mode)
-    
-    return answer
+    # Step 2: Get RS and distance from best matching chunk
+    best_distance = None
+    rs = None
+    for doc in docs:
+        if doc.get("distance") is not None:
+            best_distance = doc["distance"]
+            rs = doc['metadata'].get('rs')
+            break
 
+    # Step 3: Generate (RS instruction derived from retrieved chunks)
+    answer = generate(query, docs)
 
+    return {
+        "answer": answer,
+        "docs": docs,
+        "rs": rs,
+        "rag_distance": best_distance,
+    }
 # ============================================================
 # CLI
 # ============================================================
 
 def main():
-    """Интерактивный режим"""
-    global PROMPT_MODE
-
-        # Parse command line args
     parser = argparse.ArgumentParser()
-    parser.add_argument('--no-lora', action='store_true', help='Use base model without LoRA')
+    parser.add_argument("--chroma-dir", type=str, default=str(CHROMA_DIR), help="ChromaDB directory")
+    parser.add_argument("--lora-path", type=str, default=str(LORA_PATH), help="LoRA adapter path")
+    parser.add_argument("--no-lora", action="store_true", help="Use base model without LoRA")
     args = parser.parse_args()
-    use_lora = not args.no_lora
-    
-    print("="*60)
-    print("🎤 Спроси Лабковского! (Fine-tuned)")
-    print("="*60)
-    print("Команды:")
-    print("  'выход' или 'exit' - выход")
-    print("  'verbose' - показать источники")
-    print("  'full' / 'minimal' / 'none' - режим промпта")
+
+    print("=" * 60)
+    print("Labkovsky RAG")
+    print("=" * 60)
+    print("\nCommands:")
+    print("  'exit' — quit")
+    print("  'verbose' — toggle source display")
     print()
-    
+
+    # Initialize all components
+    print("Loading models...")
+    init_embedding()
+    init_retrieval(Path(args.chroma_dir))
+
+    lora_path = None if args.no_lora else Path(args.lora_path)
+    init_llm(use_lora=not args.no_lora, lora_path=lora_path)
+
+    print("\n[OK] Ready!\n")
+
     verbose = False
-    
-    # Инициализация
-    print("Загрузка моделей...")
-    init(use_lora)
-    print(f"\nРежим промпта: {PROMPT_MODE}")
-    print()
-    
+
     while True:
         try:
-            query = input("Ты: ").strip()
+            query = input("You: ").strip()
         except (KeyboardInterrupt, EOFError):
-            print("\n👋 Пока!")
+            print("\nPoka!")
             break
-        
+
         if not query:
             continue
-        
-        if query.lower() in ['выход', 'exit', 'quit', 'q']:
-            print("👋 Пока!")
+
+        if query.lower() in ['exit', 'quit', 'q']:
+            print("Poka!")
             break
-        
+
         if query.lower() == 'verbose':
             verbose = not verbose
-            print(f"Verbose режим: {'включен' if verbose else 'выключен'}")
+            print(f"Verbose: {'ON' if verbose else 'OFF'}")
             continue
-        
-        if query.lower() in ['full', 'minimal', 'none']:
-            PROMPT_MODE = query.lower()
-            print(f"Режим промпта: {PROMPT_MODE}")
-            continue
-        
-        print("\n🤔 Думаю...\n")
-        
+
+        print("\n...")
+
         try:
-            answer = ask_labkovsky(query, verbose=verbose)
-            print(f"Лабковский: {answer}\n")
+            result = ask_labkovsky(query)
+
+            if verbose:
+                dist = result['rag_distance']
+                rs = result['rs'] or "unknown"
+                print(f"\n--- RAG Distance: {dist:.3f} | RS: {rs} ---")
+                print(f"\n--- Retrieved Chunks ({len(result['docs'])}) ---")
+                for i, doc in enumerate(result['docs'], 1):
+                    meta = doc['metadata']
+                    qa_id = meta.get('qa_id', 'unknown')
+                    doc_rs = meta.get('rs', 'unknown')
+                    print(f"\n[{i}] QA: {qa_id} | RS: {doc_rs}")
+                    print(f"    {doc['text'][:300]}...")
+                print(f"\n--- Response ---")
+            print(f"\nLabkovsky: {result['answer']}\n")
         except Exception as e:
-            print(f"❌ Ошибка: {e}\n")
+            print(f"[ERROR] {e}")
             import traceback
             traceback.print_exc()
-
 
 if __name__ == "__main__":
     main()
