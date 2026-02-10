@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RAG Pipeline using Vikhr-YandexGPT
+RAG Pipeline for RAFT-trained pretrain model.
 
-Flow:
-1. Retrieve top-k relevant documents from ChromaDB
-2. Generate response using Vikhr's RAG format (documents role)
+Uses the same format as RAFT training:
+Документы:
+{retrieved_document}
 
-Uses the same data sources as fine-tuning for grounded responses.
+Вопрос: {question}
+Ответ:
 
 Usage:
-    python query_rag.py
+    python query_rag_for_pretrain.py
+    python query_rag_for_pretrain.py --lora-path models/labkovsky-raft-lora
 """
 
 import argparse
-import json
 import torch
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
@@ -23,17 +24,17 @@ from peft import PeftModel
 import chromadb
 
 # ============================================================
-# PATHS (adjust to your setup)
+# PATHS
 # ============================================================
 
 SCRIPT_DIR = Path(__file__).parent
-PROJECT_DIR = SCRIPT_DIR.parent.parent  # Go up to project root
+PROJECT_DIR = SCRIPT_DIR.parent.parent
 CHROMA_DIR = PROJECT_DIR / "chroma_db"
 MODELS_DIR = PROJECT_DIR / "models"
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-LLM_MODEL_NAME = "yandex/YandexGPT-5-Lite-8B-it"  # Instruction-tuned model
-LORA_PATH = MODELS_DIR / "labkovsky-vikhr-yandex-lora"
+LLM_MODEL_NAME = "yandex/YandexGPT-5-Lite-8B-pretrain"
+LORA_PATH = MODELS_DIR / "labkovsky-raft-lora"
 
 # ============================================================
 # GLOBAL STATE
@@ -44,6 +45,7 @@ _collection = None
 _llm = None
 _tokenizer = None
 
+
 def init_embedding():
     global _embed_model
     if _embed_model is None:
@@ -51,23 +53,24 @@ def init_embedding():
         _embed_model = SentenceTransformer(EMBEDDING_MODEL)
     return _embed_model
 
+
 def init_retrieval(chroma_dir: Path):
     global _collection
     if _collection is None:
         print("[+] Connecting to ChromaDB...")
         client = chromadb.PersistentClient(path=str(chroma_dir))
         _collection = client.get_collection("labkovsky")
-        print(f"   Loaded {_collection.count()} documents")
+        print(f"    Loaded {_collection.count()} documents")
     return _collection
+
 
 def init_llm(use_lora: bool = True, lora_path: Path = None):
     global _llm, _tokenizer
     if _llm is None:
         print(f"[+] Loading LLM: {LLM_MODEL_NAME}")
 
-        # Load tokenizer first - from LoRA dir if using LoRA (has added tokens)
         if use_lora and lora_path and lora_path.exists():
-            print(f"   Loading tokenizer from LoRA: {lora_path}")
+            print(f"    Loading tokenizer from LoRA: {lora_path}")
             _tokenizer = AutoTokenizer.from_pretrained(str(lora_path), trust_remote_code=True)
         else:
             _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME, trust_remote_code=True)
@@ -87,33 +90,31 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
         )
 
         if use_lora and lora_path and lora_path.exists():
-            # Resize embeddings to match LoRA tokenizer vocab
-            print(f"   Resizing embeddings: {base_model.get_input_embeddings().weight.shape[0]} -> {len(_tokenizer)}")
+            print(f"    Resizing embeddings: {base_model.get_input_embeddings().weight.shape[0]} -> {len(_tokenizer)}")
             base_model.resize_token_embeddings(len(_tokenizer))
-            print(f"   Loading LoRA: {lora_path}")
+            print(f"    Loading LoRA: {lora_path}")
             _llm = PeftModel.from_pretrained(base_model, str(lora_path))
         else:
-            print("   (base model, no LoRA)")
+            print("    (base model, no LoRA)")
             _llm = base_model
 
         _llm.eval()
-        print(f"[OK] LLM loaded ({'with LoRA' if use_lora and lora_path and lora_path.exists() else 'base only'})")
+        print(f"[OK] LLM loaded ({'with RAFT LoRA' if use_lora and lora_path and lora_path.exists() else 'base only'})")
 
     return _llm, _tokenizer
+
 
 # ============================================================
 # RETRIEVAL
 # ============================================================
 
-TOP_K = 3  # Number of documents to retrieve
-GOOD_MATCH_THRESHOLD = 0.8  # If best match distance < this, use only best match
+TOP_K = 3
+GOOD_MATCH_THRESHOLD = 0.5  # Below this = good match, use document
+NO_DOC_THRESHOLD = 1.2      # Above this = poor match, don't use document
+
 
 def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K) -> list:
-    """
-    Retrieve top-k relevant documents from ChromaDB.
-
-    Returns list of dicts with 'text', 'metadata', 'distance' keys.
-    """
+    """Retrieve top-k relevant documents from ChromaDB."""
     embed_model = init_embedding()
     collection = init_retrieval(chroma_dir)
 
@@ -144,38 +145,68 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K) -> l
 
     return documents
 
+
 # ============================================================
-# GENERATION
+# GENERATION - RAFT FORMAT
 # ============================================================
 
-# Identity prefix - disabled because training only has it on 10% of examples
-# Pretrain models work better when inference format matches training format exactly
-IDENTITY_PREFIX = ""  # Was: "Ты Михаил Лабковский..."
-
-
-def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: Path = LORA_PATH) -> str:
+def generate(query: str, context_docs: list, use_doc: bool = True, use_lora: bool = True, lora_path: Path = LORA_PATH) -> str:
     """
-    Generate response using simple text format (no chat template for pretrain model).
+    Generate response using RAFT format with RS (Response Signal) structure.
 
-    IMPORTANT: Format must EXACTLY match training format:
-    - Training: "Вопрос: {q}\nОтвет: {a}"
-    - No documents section (model wasn't trained on it)
-    - Style comes from LoRA, not from prompt/context
+    Uses all retrieved documents grouped by chunk_role:
+    - EXPLANATION: Psychology behind the issue
+    - INTERVENTION: Practical advice
+    - ESCALATION: When to seek professional help
 
-    Args:
-        query: User question
-        context_docs: List of dicts with 'text' and 'metadata' keys (for logging only)
-        use_lora: Whether to use LoRA adapter
-        lora_path: Path to LoRA adapter
+    Format:
+    Документы:
 
-    Returns:
-        Generated response string
+    [Объяснение]
+    {explanation_doc}
+
+    [Рекомендация]
+    {intervention_doc}
+
+    [Важно]
+    {escalation_doc}
+
+    Вопрос: {question}
+    Ответ: {composed_answer}
     """
     llm, tokenizer = init_llm(use_lora=use_lora, lora_path=lora_path)
 
-    # EXACT training format - no documents, no identity prefix
-    # Model learned style from LoRA, not from prompt
-    prompt = f"Вопрос: {query}\nОтвет:"
+    if context_docs and use_doc:
+        # Order: EXPLANATION → INTERVENTION → ESCALATION (Labkovsky's style)
+        rs_order = ["EXPLANATION", "INTERVENTION", "ESCALATION"]
+        rs_labels = {
+            "EXPLANATION": "Объяснение",
+            "INTERVENTION": "Рекомендация",
+            "ESCALATION": "Важно"
+        }
+
+        # Sort documents by chunk_role order
+        def get_order(doc):
+            role = doc.get('metadata', {}).get('chunk_role', '')
+            return rs_order.index(role) if role in rs_order else 99
+
+        sorted_docs = sorted(context_docs, key=get_order)
+
+        # Build structured document section in correct order
+        doc_sections = []
+        for doc in sorted_docs:
+            chunk_role = doc.get('metadata', {}).get('chunk_role', '')
+            label = rs_labels.get(chunk_role, '')
+
+            if label:
+                doc_sections.append(f"[{label}]\n{doc['text']}")
+            else:
+                doc_sections.append(doc['text'])
+
+        docs_text = "\n\n".join(doc_sections)
+        prompt = f"Документы:\n\n{docs_text}\n\nВопрос: {query}\nОтвет:"
+    else:
+        prompt = f"Вопрос: {query}\nОтвет:"
 
     inputs = tokenizer(prompt, return_tensors="pt").to(llm.device)
     input_len = inputs["input_ids"].shape[-1]
@@ -185,7 +216,7 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
             **inputs,
             max_new_tokens=512,
             do_sample=True,
-            temperature=0.3,  # Moderate temp
+            temperature=0.3,
             top_p=0.9,
             repetition_penalty=1.1,
             pad_token_id=tokenizer.eos_token_id,
@@ -196,61 +227,98 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
 
     return response
 
+
 # ============================================================
 # MAIN FUNCTION
 # ============================================================
 
-def ask_labkovsky(query: str) -> dict:
-    """Query the RAG pipeline and generate a response."""
-    # Step 1: Retrieve top-k relevant documents
+def ask_labkovsky(query: str, structured: bool = True) -> dict:
+    """Query the RAFT RAG pipeline and generate a response.
+
+    Args:
+        query: User question
+        structured: If True, generate separate responses per chunk_role and combine
+    """
     docs = retrieve(query)
 
     if not docs:
+        answer = generate(query, [], use_doc=False)
         return {
-            "answer": "Не нашёл подходящих документов.",
+            "answer": answer,
             "docs": [],
             "best_distance": None,
             "docs_used": 0,
         }
 
     best_distance = docs[0]["distance"]
+    use_doc = best_distance < NO_DOC_THRESHOLD
 
-    # Step 2: Hybrid approach - if best match is good, use only it (preserves style)
-    # If match is weak, use all docs (more context for novel questions)
-    if best_distance < GOOD_MATCH_THRESHOLD:
-        docs_for_generation = docs[:1]  # Use only best match
+    if not use_doc:
+        answer = generate(query, [], use_doc=False)
+        return {
+            "answer": answer,
+            "docs": docs,
+            "best_distance": best_distance,
+            "docs_used": 0,
+        }
+
+    if structured:
+        # Generate structured response: one answer per chunk_role
+        rs_order = ["EXPLANATION", "INTERVENTION", "ESCALATION"]
+        rs_labels = {
+            "EXPLANATION": "Объяснение",
+            "INTERVENTION": "Рекомендация",
+            "ESCALATION": "Важно"
+        }
+
+        # Group docs by chunk_role
+        docs_by_role = {}
+        for doc in docs:
+            role = doc.get('metadata', {}).get('chunk_role', 'OTHER')
+            if role not in docs_by_role:
+                docs_by_role[role] = doc
+
+        # Generate answer for each role in order
+        answer_parts = []
+        for role in rs_order:
+            if role in docs_by_role:
+                doc = docs_by_role[role]
+                part_answer = generate(query, [doc], use_doc=True)
+                label = rs_labels.get(role, role)
+                answer_parts.append(f"**{label}:** {part_answer}")
+
+        answer = "\n\n".join(answer_parts) if answer_parts else generate(query, docs, use_doc=True)
     else:
-        docs_for_generation = docs  # Use all retrieved docs
-
-    # Step 3: Generate response grounded on documents
-    answer = generate(query, docs_for_generation)
+        # Single combined response
+        answer = generate(query, docs, use_doc=True)
 
     return {
         "answer": answer,
-        "docs": docs,  # Return all retrieved for verbose display
+        "docs": docs,
         "best_distance": best_distance,
-        "docs_used": len(docs_for_generation),
+        "docs_used": len(docs),
     }
+
+
 # ============================================================
 # CLI
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--chroma-dir", type=str, default=str(CHROMA_DIR), help="ChromaDB directory")
-    parser.add_argument("--lora-path", type=str, default=str(LORA_PATH), help="LoRA adapter path")
-    parser.add_argument("--no-lora", action="store_true", help="Use base model without LoRA")
+    parser.add_argument("--chroma-dir", type=str, default=str(CHROMA_DIR))
+    parser.add_argument("--lora-path", type=str, default=str(LORA_PATH))
+    parser.add_argument("--no-lora", action="store_true")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("Labkovsky RAG")
+    print("Labkovsky RAFT RAG (Pretrain Model)")
     print("=" * 60)
     print("\nCommands:")
     print("  'exit' — quit")
     print("  'verbose' — toggle source display")
     print()
 
-    # Initialize all components
     print("Loading models...")
     init_embedding()
     init_retrieval(Path(args.chroma_dir))
@@ -303,6 +371,7 @@ def main():
             print(f"[ERROR] {e}")
             import traceback
             traceback.print_exc()
+
 
 if __name__ == "__main__":
     main()

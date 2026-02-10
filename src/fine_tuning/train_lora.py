@@ -5,14 +5,9 @@ Fine-tune Vikhr-YandexGPT on Labkovsky Q&A data.
 
 Reconstructed from checkpoint-1130 settings (eval_loss 0.7376).
 
-Uses the model's NATIVE chat template (via tokenizer.apply_chat_template)
-instead of custom Вопрос/Ответ format, so training and inference use
-the same format the model was originally trained with.
+Format: Вопрос: {question}\nОтвет: {answer}
 
-IMPORTANT: Full sequence training is used intentionally (no completion-only loss).
-The model learns from both questions AND answers, which is critical for
-Labkovsky's reactive style — his answers directly respond to the emotional
-tone and specific wording of the question.
+IMPORTANT: Full sequence training (no completion-only loss).
 
 Usage:
     python train_lora.py
@@ -20,6 +15,7 @@ Usage:
 
 import json
 import random
+import pickle
 import sys
 import torch
 import gc
@@ -35,6 +31,7 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
+from sentence_transformers import SentenceTransformer
 
 
 class MemoryCleanupCallback(TrainerCallback):
@@ -64,13 +61,17 @@ FINE_TUNING_DIR = PROJECT_ROOT / "data" / "fine_tuning"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-vikhr-yandex-lora"
 
-# Data sources (4 datasets — same as checkpoint-1130)
+# 4 data sources (Feb 2 run)
 INPUT_FILES = {
     "qa_corpus": FINE_TUNING_DIR / "qa_rs_corpus_short.jsonl",
-    "interview": PROCESSED_DIR / "interviews.jsonl",
+    "interviews": PROCESSED_DIR / "interviews.jsonl",
     "book": PROCESSED_DIR / "Hochu_i_budu_with_questions.jsonl",
     "articles": PROCESSED_DIR / "articles_with_questions.jsonl",
 }
+
+# RS Classifier
+RS_CLASSIFIER_PATH = PROJECT_ROOT / "models" / "rs_classifier" / "rs_classifier.pkl"
+RS_TOKENS = ["<RS=EXPLANATION>", "<RS=INTERVENTION>", "<RS=ESCALATION>"]
 
 # Model
 MODEL_NAME = "Vikhrmodels/Vikhr-YandexGPT-5-Lite-8B-it"
@@ -97,12 +98,11 @@ RANDOM_SEED = 42
 
 def load_all_data(input_files: dict) -> list:
     """
-    Load training data from all specified JSONL files.
+    Load all 4 data sources.
 
-    Handles two formats:
-      - qa_corpus: has 'question' and 'answer' fields directly
-      - interviews/book/articles: has 'text' (answer) and 'potential_questions' (list),
-        we take only the first question from the list
+    Formats:
+    - qa_corpus: {"question": ..., "answer": ...}
+    - interviews/book/articles: {"text": ..., "potential_questions": [...]}
     """
     records = []
 
@@ -121,29 +121,25 @@ def load_all_data(input_files: dict) -> list:
                 except json.JSONDecodeError:
                     continue
 
-                # Format A: direct question/answer (qa_corpus)
+                # Format A: qa_corpus (question/answer)
                 if 'question' in data and 'answer' in data:
-                    question = data['question']
-                    answer = data['answer']
-                # Format B: text + potential_questions (interviews, book, articles)
-                elif 'text' in data and 'potential_questions' in data:
-                    questions_list = data['potential_questions']
-                    if not questions_list:
-                        continue
-                    question = questions_list[0]  # Take only the first question
-                    answer = data['text']
-                else:
-                    continue
-
-                if question and answer:
                     records.append({
-                        'question': question,
-                        'answer': answer,
-                        'source': source_name
+                        'question': data['question'],
+                        'answer': data['answer'],
                     })
                     count += 1
+                # Format B: text + potential_questions
+                elif 'text' in data and 'potential_questions' in data:
+                    questions = data['potential_questions']
+                    if questions:
+                        # Take first question only
+                        records.append({
+                            'question': questions[0],
+                            'answer': data['text'],
+                        })
+                        count += 1
 
-        print(f"  {source_name} ({filepath.name}): {count} examples")
+        print(f"  {source_name}: {count} examples")
 
     print(f"Total: {len(records)} examples")
     return records
@@ -151,34 +147,17 @@ def load_all_data(input_files: dict) -> list:
 
 def format_for_sft(examples, tokenizer):
     """
-    Format using the model's native chat template.
+    Format as Вопрос/Ответ text.
 
-    Uses tokenizer.apply_chat_template() so the training data matches
-    exactly what the model expects at inference time. No custom format needed.
-
-    FULL SEQUENCE TRAINING: We return the complete formatted text (user + assistant).
-    No DataCollatorForCompletionOnlyLM is used — the model calculates loss on ALL
-    tokens, learning both to understand questions and generate Labkovsky-style answers.
+    FULL SEQUENCE TRAINING: Loss is computed on ALL tokens.
     """
     texts = []
+    eos = tokenizer.eos_token
 
     for i in range(len(examples["question"])):
         question = examples["question"][i]
         answer = examples["answer"][i]
-
-        # Build messages in the standard chat format
-        messages = [
-            {"role": "user", "content": question},
-            {"role": "assistant", "content": answer},
-        ]
-
-        # Let the tokenizer apply the model's native template
-        # tokenize=False returns a string (not token IDs) — SFTTrainer handles tokenization
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,  # We include the full assistant response
-        )
+        text = f"Вопрос: {question}\nОтвет: {answer}{eos}"
         texts.append(text)
 
     return {"text": texts}
@@ -195,7 +174,7 @@ def main():
     print("=" * 60)
     print("Labkovsky Fine-tuning (Vikhr + LoRA r=32)")
     print("Reconstructed from checkpoint-1130")
-    print("Using native chat template + full sequence training")
+    print("Using 4 data sources (qa_corpus + interviews + book + articles)")
     print("=" * 60)
 
     if not torch.cuda.is_available():
@@ -250,16 +229,6 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Show what the chat template looks like
-    print(f"\n--- Chat template preview ---")
-    sample_messages = [
-        {"role": "user", "content": "Тестовый вопрос?"},
-        {"role": "assistant", "content": "Тестовый ответ."},
-    ]
-    preview = tokenizer.apply_chat_template(sample_messages, tokenize=False, add_generation_prompt=False)
-    print(repr(preview))
-    print("--- End preview ---\n")
-
     # LoRA
     print(f"Preparing LoRA (r={LORA_R}, alpha={LORA_ALPHA})...")
     model = prepare_model_for_kbit_training(model)
@@ -280,8 +249,8 @@ def main():
     model.gradient_checkpointing_enable()
     model.print_trainable_parameters()
 
-    # Format data using native chat template
-    print(f"\nFormatting data with native chat template...")
+    # Format data
+    print(f"\nFormatting data...")
     format_fn = partial(format_for_sft, tokenizer=tokenizer)
     train_dataset = train_dataset.map(format_fn, batched=True)
     eval_dataset = eval_dataset.map(format_fn, batched=True)

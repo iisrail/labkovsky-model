@@ -9,13 +9,13 @@ MODELS_DIR = PROJECT_ROOT / "models"
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 
 # === MODEL ===
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
-LORA_PATH = MODELS_DIR / "labkovsky-qwen7b-lora-rs"
+MODEL_NAME = "Vikhrmodels/Vikhr-YandexGPT-5-Lite-8B-it"  # Instruction-tuned, follows prompts
+LORA_PATH = MODELS_DIR / "labkovsky-vikhr-yandex-lora"
 
 # === RS TOKENS ===
-RS_TOKENS = ["<RS=INTERVENTION>", "<RS=EXPLANATION>", "<RS=ESCALATION>"]
+RS_TOKENS = ["[ОБЪЯСНЕНИЕ]", "[ВМЕШАТЕЛЬСТВО]", "[ЭСКАЛАЦИЯ]"]
 
 # === GENERATION ===
-MAX_NEW_TOKENS = 1024
-TEMPERATURE = 0.7
-REPETITION_PENALTY = 1.1
+MAX_NEW_TOKENS = 512
+TEMPERATURE = 1.0
+REPETITION_PENALTY = 1.2
