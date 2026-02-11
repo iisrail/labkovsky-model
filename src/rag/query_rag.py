@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import json
+import re
 import torch
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
@@ -32,8 +33,11 @@ CHROMA_DIR = PROJECT_DIR / "chroma_db"
 MODELS_DIR = PROJECT_DIR / "models"
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-LLM_MODEL_NAME = "yandex/YandexGPT-5-Lite-8B-it"  # Instruction-tuned model
-LORA_PATH = MODELS_DIR / "labkovsky-vikhr-yandex-lora"
+LLM_MODEL_NAME = "Vikhrmodels/Vikhr-YandexGPT-5-Lite-8B-it"
+LORA_PATH = MODELS_DIR / "labkovsky-vikhr-lora-unsloth"
+
+# Simple system prompt - LoRA adds Labkovsky's tone, Vikhr handles RAG grounding
+SYSTEM_PROMPT = "Ответь кратко, используя только информацию из документов."
 
 # ============================================================
 # GLOBAL STATE
@@ -65,12 +69,9 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
     if _llm is None:
         print(f"[+] Loading LLM: {LLM_MODEL_NAME}")
 
-        # Load tokenizer first - from LoRA dir if using LoRA (has added tokens)
-        if use_lora and lora_path and lora_path.exists():
-            print(f"   Loading tokenizer from LoRA: {lora_path}")
-            _tokenizer = AutoTokenizer.from_pretrained(str(lora_path), trust_remote_code=True)
-        else:
-            _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME, trust_remote_code=True)
+        # Always load tokenizer from base model (Unsloth LoRA doesn't add tokens)
+        _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME, trust_remote_code=True)
+        _tokenizer.pad_token = _tokenizer.eos_token
 
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -87,9 +88,6 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
         )
 
         if use_lora and lora_path and lora_path.exists():
-            # Resize embeddings to match LoRA tokenizer vocab
-            print(f"   Resizing embeddings: {base_model.get_input_embeddings().weight.shape[0]} -> {len(_tokenizer)}")
-            base_model.resize_token_embeddings(len(_tokenizer))
             print(f"   Loading LoRA: {lora_path}")
             _llm = PeftModel.from_pretrained(base_model, str(lora_path))
         else:
@@ -106,7 +104,6 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
 # ============================================================
 
 TOP_K = 3  # Number of documents to retrieve
-GOOD_MATCH_THRESHOLD = 0.8  # If best match distance < this, use only best match
 
 def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K) -> list:
     """
@@ -148,23 +145,15 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K) -> l
 # GENERATION
 # ============================================================
 
-# Identity prefix - disabled because training only has it on 10% of examples
-# Pretrain models work better when inference format matches training format exactly
-IDENTITY_PREFIX = ""  # Was: "Ты Михаил Лабковский..."
 
 
 def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: Path = LORA_PATH) -> str:
     """
-    Generate response using simple text format (no chat template for pretrain model).
-
-    IMPORTANT: Format must EXACTLY match training format:
-    - Training: "Вопрос: {q}\nОтвет: {a}"
-    - No documents section (model wasn't trained on it)
-    - Style comes from LoRA, not from prompt/context
+    Generate response using Vikhr's native RAG format (documents role).
 
     Args:
         query: User question
-        context_docs: List of dicts with 'text' and 'metadata' keys (for logging only)
+        context_docs: List of dicts with 'text' and 'metadata' keys
         use_lora: Whether to use LoRA adapter
         lora_path: Path to LoRA adapter
 
@@ -173,9 +162,27 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
     """
     llm, tokenizer = init_llm(use_lora=use_lora, lora_path=lora_path)
 
-    # EXACT training format - no documents, no identity prefix
-    # Model learned style from LoRA, not from prompt
-    prompt = f"Вопрос: {query}\nОтвет:"
+    # Format documents for Vikhr's native RAG format
+    docs_for_prompt = []
+    for i, doc in enumerate(context_docs):
+        docs_for_prompt.append({
+            "doc_id": i,
+            "title": doc.get("metadata", {}).get("source_type", "Labkovsky"),
+            "content": doc["text"]
+        })
+
+    # Vikhr's native RAG format with documents role
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "documents", "content": json.dumps(docs_for_prompt, ensure_ascii=False)},
+        {"role": "user", "content": query},
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
 
     inputs = tokenizer(prompt, return_tensors="pt").to(llm.device)
     input_len = inputs["input_ids"].shape[-1]
@@ -185,7 +192,7 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
             **inputs,
             max_new_tokens=512,
             do_sample=True,
-            temperature=0.3,  # Moderate temp
+            temperature=0.3,
             top_p=0.9,
             repetition_penalty=1.1,
             pad_token_id=tokenizer.eos_token_id,
@@ -193,6 +200,11 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
 
     generated_tokens = outputs[0][input_len:]
     response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+    # Strip RS markers from output
+    response = re.sub(r'\[(ОБЪЯСНЕНИЕ|ВМЕШАТЕЛЬСТВО|ЭСКАЛАЦИЯ)\]\s*', '', response)
+    response = re.sub(r'Не требуется\.?\s*', '', response)
+    response = response.strip()
 
     return response
 
@@ -215,12 +227,8 @@ def ask_labkovsky(query: str) -> dict:
 
     best_distance = docs[0]["distance"]
 
-    # Step 2: Hybrid approach - if best match is good, use only it (preserves style)
-    # If match is weak, use all docs (more context for novel questions)
-    if best_distance < GOOD_MATCH_THRESHOLD:
-        docs_for_generation = docs[:1]  # Use only best match
-    else:
-        docs_for_generation = docs  # Use all retrieved docs
+    # Step 2: Use all retrieved docs for richer context
+    docs_for_generation = docs
 
     # Step 3: Generate response grounded on documents
     answer = generate(query, docs_for_generation)

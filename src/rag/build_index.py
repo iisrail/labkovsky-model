@@ -34,7 +34,7 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 # Files to index
 TARGET_FILES = {
-    "qa_corpus": DATA_DIR / "qa_rs_final.jsonl",  # Segmented with RS tags
+    "qa_corpus": DATA_DIR / "qa_rs_final.jsonl",  # Segmented answers with RS markers
     "articles": PROCESSED_DIR / "articles_with_questions.jsonl",
 }
 
@@ -85,8 +85,11 @@ def extract_text_for_embedding(record: dict) -> str:
 
 
 def extract_answer_for_document(record: dict) -> str:
-    """Extract answer only for document content (what model sees for generation)."""
-    # Prefer segmented answer (RS format) if available
+    """Extract answer only for document content (what model sees for generation).
+
+    Uses 'answer_segmented' if available (has RS structure markers).
+    """
+    # Prefer segmented answer with RS markers for structured RAG
     return record.get("answer_segmented", record.get(ANSWER_FIELD, record.get("text", "")))
 
 
