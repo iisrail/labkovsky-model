@@ -113,11 +113,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
 FINE_TUNING_DIR = PROJECT_ROOT / "data" / "fine_tuning"
-OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-vikhr-lora-unsloth"
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-vikhr-lora-attn"
 
 INPUT_FILES = {
     "qa_final": FINE_TUNING_DIR / "qa_rs_final.jsonl",
     "anti_generic": FINE_TUNING_DIR / "anti_generic_clean.jsonl",
+    "interviews": PROCESSED_DIR / "interviews.jsonl",
+    "book": PROCESSED_DIR / "Hochu_i_budu_with_questions.jsonl",
 }
 
 MODEL_NAME = "Vikhrmodels/Vikhr-YandexGPT-5-Lite-8B-it"
@@ -125,7 +128,7 @@ MAX_SEQ_LENGTH = 1024
 
 # Small LoRA to preserve RAG grounding
 LORA_R = 8
-LORA_ALPHA = 16
+LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
 
 # Training
@@ -200,6 +203,22 @@ def load_all_data(input_files: Dict[str, Path]) -> List[dict]:
                         "source": src
                     })
                     cnt += 1
+                continue
+
+            # articles/interviews/book: {"text": ..., "potential_questions": [...]}
+            if "text" in obj and "potential_questions" in obj:
+                text = obj.get("text")
+                questions = obj.get("potential_questions") or []
+                if isinstance(text, str) and text.strip() and questions:
+                    # Use first question
+                    q = questions[0] if isinstance(questions[0], str) else None
+                    if q and q.strip():
+                        records.append({
+                            "question": q.strip(),
+                            "answer": text.strip(),
+                            "source": src
+                        })
+                        cnt += 1
                 continue
 
         print(f"  {src} ({fp.name}): {cnt} examples")
@@ -344,10 +363,9 @@ def main():
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
         bias="none",
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
+        # All 4 attention modules (no MLP)
+        # Style comes from how model "looks at" context
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         use_gradient_checkpointing="unsloth",
         random_state=RANDOM_SEED,
         use_rslora=False,

@@ -21,7 +21,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MODELS_DIR = PROJECT_ROOT / "models"
 
 MODEL_NAME = "Vikhrmodels/Vikhr-YandexGPT-5-Lite-8B-it"
-DEFAULT_LORA_DIR = MODELS_DIR / "labkovsky-vikhr-lora-unsloth"
+DEFAULT_LORA_DIR = MODELS_DIR / "labkovsky-vikhr-lora-attn"
 
 # Same system prompt as training
 SYSTEM_PROMPT = (

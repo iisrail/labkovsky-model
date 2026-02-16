@@ -34,7 +34,7 @@ MODELS_DIR = PROJECT_DIR / "models"
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 LLM_MODEL_NAME = "Vikhrmodels/Vikhr-YandexGPT-5-Lite-8B-it"
-LORA_PATH = MODELS_DIR / "labkovsky-vikhr-lora-unsloth"
+LORA_PATH = MODELS_DIR / "labkovsky-vikhr-lora-attn"
 
 # Simple system prompt - LoRA adds Labkovsky's tone, Vikhr handles RAG grounding
 SYSTEM_PROMPT = "Ответь кратко, используя только информацию из документов."
