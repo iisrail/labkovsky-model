@@ -33,11 +33,16 @@ CHROMA_DIR = PROJECT_DIR / "chroma_db"
 MODELS_DIR = PROJECT_DIR / "models"
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-LLM_MODEL_NAME = "Vikhrmodels/Vikhr-YandexGPT-5-Lite-8B-it"
-LORA_PATH = MODELS_DIR / "labkovsky-vikhr-lora-attn"
+LLM_MODEL_NAME = "./models/vikhr-book-merged"
+LORA_PATH = MODELS_DIR / "labkovsky-merged-base-qa-lora"
 
-# Simple system prompt - LoRA adds Labkovsky's tone, Vikhr handles RAG grounding
-SYSTEM_PROMPT = "Ответь кратко, используя только информацию из документов."
+# System prompt template - docs will be inserted
+SYSTEM_PROMPT_TEMPLATE = (
+    "Ты психолог Михаил Лабковский. Используй следующие документы для ответа:\n\n"
+    "{docs}\n\n"
+    "Отвечай в стиле Лабковского: прямо, уверенно, с конкретными рекомендациями. "
+    "Применяй подход из документов к конкретной ситуации пользователя."
+)
 
 # ============================================================
 # GLOBAL STATE
@@ -103,11 +108,75 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
 # RETRIEVAL
 # ============================================================
 
-TOP_K = 3  # Number of documents to retrieve
+TOP_K = 2  # Reduced to minimize irrelevant context
+INCLUDE_SIBLINGS = False  # Disabled - was adding noise
 
-def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K) -> list:
+
+def _get_sibling_ids(doc_id: str, metadata: dict) -> list:
+    """
+    Generate IDs for neighboring chunks (N-1, N+1).
+
+    Handles formats like:
+    - "article_id_chunk2" -> ["article_id_chunk1", "article_id_chunk3"]
+    - "video_01_expl" -> [] (Q&A, no siblings)
+    """
+    chunk_id = metadata.get("chunk_id")
+    if chunk_id is None:
+        return []
+
+    try:
+        chunk_num = int(chunk_id)
+    except (ValueError, TypeError):
+        return []
+
+    # Build sibling IDs based on document ID pattern
+    siblings = []
+    base_id = doc_id.rsplit("_chunk", 1)[0] if "_chunk" in doc_id else None
+
+    if base_id:
+        # Article/book format: "article_id_chunk2"
+        if chunk_num > 0:
+            siblings.append(f"{base_id}_chunk{chunk_num - 1}")
+        siblings.append(f"{base_id}_chunk{chunk_num + 1}")
+
+    return siblings
+
+
+def _fetch_siblings(collection, doc_ids: list) -> dict:
+    """Fetch documents by IDs from collection."""
+    if not doc_ids:
+        return {}
+
+    try:
+        results = collection.get(
+            ids=doc_ids,
+            include=["documents", "metadatas"]
+        )
+
+        siblings = {}
+        for doc_id, doc, meta in zip(
+            results['ids'],
+            results['documents'],
+            results['metadatas']
+        ):
+            siblings[doc_id] = {
+                "id": doc_id,
+                "text": doc,
+                "metadata": meta,
+                "distance": None,  # Not from similarity search
+                "is_sibling": True
+            }
+        return siblings
+    except Exception:
+        return {}
+
+
+def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K, include_siblings: bool = INCLUDE_SIBLINGS) -> list:
     """
     Retrieve top-k relevant documents from ChromaDB.
+
+    If include_siblings=True, also fetches neighboring chunks (N-1, N+1)
+    for articles/book to provide context for connected chunks.
 
     Returns list of dicts with 'text', 'metadata', 'distance' keys.
     """
@@ -126,6 +195,9 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K) -> l
         return []
 
     documents = []
+    seen_ids = set()
+    sibling_ids_to_fetch = []
+
     for doc_id, doc, meta, dist in zip(
         results['ids'][0],
         results['documents'][0],
@@ -136,8 +208,54 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K) -> l
             "id": doc_id,
             "text": doc,
             "metadata": meta,
-            "distance": dist
+            "distance": dist,
+            "is_sibling": False
         })
+        seen_ids.add(doc_id)
+
+        # Collect sibling IDs
+        if include_siblings:
+            for sib_id in _get_sibling_ids(doc_id, meta):
+                if sib_id not in seen_ids:
+                    sibling_ids_to_fetch.append(sib_id)
+                    seen_ids.add(sib_id)
+
+    # Fetch siblings
+    if sibling_ids_to_fetch:
+        siblings = _fetch_siblings(collection, sibling_ids_to_fetch)
+
+        # Insert siblings in correct order (before/after their parent)
+        expanded_docs = []
+        for doc in documents:
+            doc_id = doc["id"]
+            chunk_id = doc["metadata"].get("chunk_id")
+
+            if chunk_id is not None:
+                try:
+                    chunk_num = int(chunk_id)
+                    base_id = doc_id.rsplit("_chunk", 1)[0] if "_chunk" in doc_id else None
+
+                    if base_id:
+                        # Add previous sibling first
+                        prev_id = f"{base_id}_chunk{chunk_num - 1}"
+                        if prev_id in siblings:
+                            expanded_docs.append(siblings[prev_id])
+
+                        # Add main doc
+                        expanded_docs.append(doc)
+
+                        # Add next sibling after
+                        next_id = f"{base_id}_chunk{chunk_num + 1}"
+                        if next_id in siblings:
+                            expanded_docs.append(siblings[next_id])
+                    else:
+                        expanded_docs.append(doc)
+                except (ValueError, TypeError):
+                    expanded_docs.append(doc)
+            else:
+                expanded_docs.append(doc)
+
+        documents = expanded_docs
 
     return documents
 
@@ -149,7 +267,7 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K) -> l
 
 def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: Path = LORA_PATH) -> str:
     """
-    Generate response using Vikhr's native RAG format (documents role).
+    Generate response with docs in system prompt (not documents role).
 
     Args:
         query: User question
@@ -162,19 +280,17 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
     """
     llm, tokenizer = init_llm(use_lora=use_lora, lora_path=lora_path)
 
-    # Format documents for Vikhr's native RAG format
-    docs_for_prompt = []
-    for i, doc in enumerate(context_docs):
-        docs_for_prompt.append({
-            "doc_id": i,
-            "title": doc.get("metadata", {}).get("source_type", "Labkovsky"),
-            "content": doc["text"]
-        })
+    # Format documents as text for system prompt
+    docs_text = "\n\n".join([
+        f"Документ {i+1}: {doc['text']}"
+        for i, doc in enumerate(context_docs)
+    ])
 
-    # Vikhr's native RAG format with documents role
+    # Put docs in system prompt (NOT documents role - that's for ranking)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(docs=docs_text)
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "documents", "content": json.dumps(docs_for_prompt, ensure_ascii=False)},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": query},
     ]
 
@@ -192,19 +308,17 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
             **inputs,
             max_new_tokens=512,
             do_sample=True,
-            temperature=0.3,
+            temperature=0.7,
             top_p=0.9,
             repetition_penalty=1.1,
+            no_repeat_ngram_size=4,  # Prevent copying 4+ word sequences from RAG
             pad_token_id=tokenizer.eos_token_id,
         )
 
     generated_tokens = outputs[0][input_len:]
     response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
-    # Strip RS markers from output
-    response = re.sub(r'\[(ОБЪЯСНЕНИЕ|ВМЕШАТЕЛЬСТВО|ЭСКАЛАЦИЯ)\]\s*', '', response)
-    response = re.sub(r'Не требуется\.?\s*', '', response)
-    response = response.strip()
+    # No stripping — show raw output with RS markers for debugging
 
     return response
 
@@ -303,7 +417,10 @@ def main():
                     meta = doc['metadata']
                     source = meta.get('source_type', 'unknown')
                     doc_id = doc.get('id', 'unknown')
-                    print(f"\n[{i}] {source} | {doc_id} | dist: {doc['distance']:.3f}")
+                    is_sib = doc.get('is_sibling', False)
+                    sib_tag = " [sibling]" if is_sib else ""
+                    dist_str = f"dist: {doc['distance']:.3f}" if doc['distance'] else "context"
+                    print(f"\n[{i}] {source} | {doc_id} | {dist_str}{sib_tag}")
                     print(f"    {doc['text'][:300]}...")
                 print(f"\n--- Response ---")
             print(f"\nLabkovsky: {result['answer']}\n")

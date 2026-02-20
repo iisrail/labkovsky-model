@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_lora_unsloth.py
+train_qa_special_tokens.py
 
-Unsloth fine-tuning with UNIQUE ANSWER split (no data leakage).
-
-Key design decisions:
-- Small LoRA (r=8, alpha=16) to preserve Vikhr's RAG grounding ability
-- Split by UNIQUE ANSWERS to avoid train/eval overlap
-- COMPLETION-ONLY training (only train on assistant response, not question)
-- System prompt defines Labkovsky persona
-
-Data:
-- qa_rs_final.jsonl (QA pairs with Russian RS markers: ОБЪЯСНЕНИЕ, ВМЕШАТЕЛЬСТВО, ЭСКАЛАЦИЯ)
-- anti_generic_clean.jsonl (128 boundary examples)
+QA LoRA training on merged base with dedicated RS special tokens.
+Adds [ОБЪЯСНЕНИЕ], [ВМЕШАТЕЛЬСТВО], [ЭСКАЛАЦИЯ] as single-token specials.
+Includes embed_tokens and lm_head in LoRA targets to train the new embeddings.
 
 Usage (WSL):
     source venv_wsl/bin/activate
-    python src/fine_tuning/train_lora_unsloth.py
+    python src/fine_tuning/train_qa_special_tokens.py
 """
 
 # ---- MUST BE FIRST ----
@@ -114,34 +106,40 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
 FINE_TUNING_DIR = PROJECT_ROOT / "data" / "fine_tuning"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-vikhr-lora-r8a32"
+OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-merged-special-tokens"
 
+# QA data + anti_generic with RS tags
 INPUT_FILES = {
     "qa_final": FINE_TUNING_DIR / "qa_rs_final.jsonl",
-    "anti_generic": FINE_TUNING_DIR / "anti_generic_clean.jsonl",
-    "book": PROCESSED_DIR / "Hochu_i_budu_with_questions.jsonl",
+    "anti_generic": FINE_TUNING_DIR / "anti_generic_tagged.jsonl",
     "interviews": PROCESSED_DIR / "interviews.jsonl",
 }
 
-MODEL_NAME = "Vikhrmodels/Vikhr-YandexGPT-5-Lite-8B-it"
+MODEL_NAME = "./models/vikhr-book-merged"
 MAX_SEQ_LENGTH = 1024
 
-# Stronger LoRA for better style capture
+# RS special tokens
+RS_SPECIAL_TOKENS = ["[ОБЪЯСНЕНИЕ]", "[ВМЕШАТЕЛЬСТВО]", "[ЭСКАЛАЦИЯ]"]
+
+# ALL 7 modules (attention + MLP), embeddings trained directly (not via LoRA)
 LORA_R = 8
-LORA_ALPHA = 32
+LORA_ALPHA = 16  # ratio 2
 LORA_DROPOUT = 0.0
+TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+]
 
 # Training
 BATCH_SIZE = 1
 GRADIENT_ACCUMULATION = 16  # effective batch = 16
-LEARNING_RATE = 2e-5
-NUM_EPOCHS = 20  # increased from 5
+LEARNING_RATE = 2e-4
+NUM_EPOCHS = 20
 WARMUP_RATIO = 0.05
 VAL_RATIO = 0.15
 RANDOM_SEED = 42
 
-# Resume training from checkpoint
-RESUME_FROM_CHECKPOINT = False  # Fresh start with new data
+RESUME_FROM_CHECKPOINT = False
 
 # System prompt for Labkovsky persona
 SYSTEM_PROMPT = (
@@ -194,7 +192,7 @@ def load_all_data(input_files: Dict[str, Path]) -> List[dict]:
                     cnt += 1
                 continue
 
-            # anti_generic_clean.jsonl: {"question": ..., "answer": ...}
+            # interviews.jsonl: {"question": ..., "answer": ...}
             if "question" in obj and "answer" in obj:
                 q = obj.get("question")
                 a = obj.get("answer")
@@ -203,27 +201,9 @@ def load_all_data(input_files: Dict[str, Path]) -> List[dict]:
                         "question": q.strip(),
                         "answer": a.strip(),
                         "source": src,
-                        "id": ""
+                        "id": obj.get("id", "")
                     })
                     cnt += 1
-                continue
-
-            # book: {"text": ..., "potential_questions": [...], "chunk_id": ...}
-            # Use only first question (no x3 multiplier)
-            if "text" in obj and "potential_questions" in obj:
-                text = obj.get("text")
-                questions = obj.get("potential_questions") or []
-                chunk_id = obj.get("chunk_id", "")
-                if isinstance(text, str) and text.strip() and questions:
-                    q = questions[0]  # Only first question
-                    if isinstance(q, str) and q.strip():
-                        records.append({
-                            "question": q.strip(),
-                            "answer": text.strip(),
-                            "source": src,
-                            "id": f"chunk_{chunk_id}"
-                        })
-                        cnt += 1
                 continue
 
         print(f"  {src} ({fp.name}): {cnt} examples")
@@ -235,11 +215,6 @@ def load_all_data(input_files: Dict[str, Path]) -> List[dict]:
 def split_by_unique_answers(records: List[dict], val_ratio: float, seed: int):
     """
     Split ALL data by UNIQUE ANSWERS to prevent data leakage.
-
-    Groups records by answer text, then splits groups (not individual records).
-    This ensures no answer appears in both train and eval sets.
-
-    Prints eval IDs so we know which samples weren't memorized.
     """
     # Group ALL records by answer
     answer_groups = defaultdict(list)
@@ -276,7 +251,9 @@ def split_by_unique_answers(records: List[dict], val_ratio: float, seed: int):
     # Print eval IDs (for testing non-memorized samples)
     eval_ids = [r.get("id", "") for r in eval_records if r.get("id")]
     print(f"\nEval IDs ({len(eval_ids)} samples):")
-    print(eval_ids)
+    print(eval_ids[:50])  # Print first 50
+    if len(eval_ids) > 50:
+        print(f"  ... and {len(eval_ids) - 50} more")
 
     return train_records, eval_records
 
@@ -286,11 +263,7 @@ def split_by_unique_answers(records: List[dict], val_ratio: float, seed: int):
 # =============================================================================
 
 def format_for_sft(examples, tokenizer):
-    """
-    Format using Vikhr's native chat template with system prompt.
-
-    Full sequence training: loss on ALL tokens (no completion-only).
-    """
+    """Format using Vikhr's native chat template with system prompt."""
     texts = []
     for i in range(len(examples["question"])):
         q = examples["question"][i]
@@ -318,9 +291,13 @@ def format_for_sft(examples, tokenizer):
 
 def main():
     print("=" * 60)
-    print("Labkovsky Fine-tuning (Unsloth + Small LoRA)")
+    print("Labkovsky Fine-tuning (SPECIAL TOKENS + ALL MODULES)")
+    print("Base: vikhr-book-merged (has book vocabulary)")
+    print("Special tokens: [ОБЪЯСНЕНИЕ], [ВМЕШАТЕЛЬСТВО], [ЭСКАЛАЦИЯ]")
+    print("Modules: all 7 + direct embedding grad for new tokens")
+    print("Data: QA only (no book)")
     print("Split by UNIQUE ANSWERS (no data leakage)")
-    print("COMPLETION-ONLY training (response_template='<s>assistant')")
+    print("COMPLETION-ONLY training")
     print("=" * 60)
 
     if not torch.cuda.is_available():
@@ -354,30 +331,41 @@ def main():
         model_name=MODEL_NAME,
         max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=True,
-        dtype=None,  # auto-detect
+        dtype=None,
         trust_remote_code=True,
     )
 
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # Prevent double BOS/EOS
     if hasattr(tokenizer, "add_bos_token"):
         tokenizer.add_bos_token = False
     if hasattr(tokenizer, "add_eos_token"):
         tokenizer.add_eos_token = False
 
-    # LoRA (small to preserve RAG grounding)
+    # Add RS special tokens
+    print(f"\nAdding special tokens: {RS_SPECIAL_TOKENS}")
+    num_added = tokenizer.add_tokens(RS_SPECIAL_TOKENS, special_tokens=True)
+    print(f"  Added {num_added} new tokens")
+    model.resize_token_embeddings(len(tokenizer))
+    print(f"  Resized embeddings to {len(tokenizer)}")
+
+    # Verify single-token encoding
+    print("\nVerifying special token IDs:")
+    for t in RS_SPECIAL_TOKENS:
+        ids = tokenizer.encode(t, add_special_tokens=False)
+        print(f"  {t} -> {ids} (should be single token)")
+
+    # ALL 7 MODULES LoRA (no embed/lm_head — those are trained directly)
     print(f"\nPreparing LoRA: r={LORA_R}, alpha={LORA_ALPHA}")
+    print(f"  Target modules: {TARGET_MODULES}")
     model = FastLanguageModel.get_peft_model(
         model,
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
         lora_dropout=LORA_DROPOUT,
         bias="none",
-        # All attention + MLP modules
-        # Attention for style, MLP for content/reasoning adaptation
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=TARGET_MODULES,
         use_gradient_checkpointing="unsloth",
         random_state=RANDOM_SEED,
         use_rslora=False,
@@ -385,6 +373,19 @@ def main():
         max_seq_length=MAX_SEQ_LENGTH,
     )
     model.print_trainable_parameters()
+
+    # Train only the 3 new token embeddings directly (not via LoRA)
+    print("\nEnabling gradients for new token embeddings only...")
+    model.get_input_embeddings().weight.requires_grad_(False)
+    for i in range(len(RS_SPECIAL_TOKENS)):
+        model.get_input_embeddings().weight[-len(RS_SPECIAL_TOKENS) + i].requires_grad = True
+
+    model.get_output_embeddings().weight.requires_grad_(False)
+    for i in range(len(RS_SPECIAL_TOKENS)):
+        model.get_output_embeddings().weight[-len(RS_SPECIAL_TOKENS) + i].requires_grad = True
+
+    print(f"  Input embeddings: last {len(RS_SPECIAL_TOKENS)} rows have grad=True")
+    print(f"  Output embeddings: last {len(RS_SPECIAL_TOKENS)} rows have grad=True")
 
     # Format data
     print("\nFormatting dataset with chat template + system prompt...")
@@ -394,7 +395,7 @@ def main():
     print("\nSample (first 500 chars):")
     print(train_ds[0]["text"][:500])
 
-    # Completion-only collator (train only on assistant response)
+    # Completion-only collator
     collator = CompletionOnlyCollator(tokenizer=tokenizer)
 
     # Trainer config
@@ -421,11 +422,10 @@ def main():
         max_length=MAX_SEQ_LENGTH,
         dataset_text_field="text",
         packing=False,
-        # Using custom CompletionOnlyCollator for completion-only training
         dataset_kwargs={"add_special_tokens": False},
     )
 
-    # Build trainer with completion-only collator
+    # Build trainer
     try:
         trainer = SFTTrainer(
             model=model,
@@ -437,7 +437,6 @@ def main():
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
         )
     except TypeError:
-        # Older TRL versions use tokenizer instead of processing_class
         trainer = SFTTrainer(
             model=model,
             tokenizer=tokenizer,
@@ -449,14 +448,15 @@ def main():
         )
 
     print("\nStarting training...")
-    print(f"  LoRA: r={LORA_R}, alpha={LORA_ALPHA} (small to preserve RAG)")
+    print(f"  Base model: {MODEL_NAME}")
+    print(f"  Special tokens: {RS_SPECIAL_TOKENS}")
+    print(f"  LoRA: r={LORA_R}, alpha={LORA_ALPHA}")
+    print(f"  Modules: {TARGET_MODULES} (ALL 7 + new token embeds)")
     print(f"  Batch effective: {BATCH_SIZE * GRADIENT_ACCUMULATION}")
     print(f"  LR: {LEARNING_RATE}, scheduler: cosine, warmup: {WARMUP_RATIO}")
     print(f"  Epochs: {NUM_EPOCHS}, early stopping patience: 3")
     print(f"  Split: by UNIQUE ANSWERS (no leakage)")
-    print(f"  Training: full sequence (no completion-only)")
-    print(f"  System prompt: YES")
-    print(f"  Resume: {RESUME_FROM_CHECKPOINT}")
+    print(f"  Output: {OUTPUT_DIR}")
 
     if RESUME_FROM_CHECKPOINT:
         trainer.train(resume_from_checkpoint=True)
