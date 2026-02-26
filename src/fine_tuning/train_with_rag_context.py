@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train_qa_on_merged_base.py
+train_with_rag_context.py
 
-QA LoRA training on the merged base model (vikhr-book-merged).
-Uses ALL 7 modules (attention + MLP) since the base already has book vocabulary.
-Only QA data — no book data.
+LoRA training with RAG context in system prompt — matching inference format.
+Uses qa_with_rag_context.jsonl built by build_rag_training_data.py.
 
-Usage (WSL):
-    source venv_wsl/bin/activate
-    python src/fine_tuning/train_qa_on_merged_base.py
+First run:
+    python src/fine_tuning/build_rag_training_data.py
+Then:
+    python src/fine_tuning/train_with_rag_context.py
 """
 
 # ---- MUST BE FIRST ----
@@ -31,7 +31,7 @@ from trl import SFTTrainer, SFTConfig
 
 
 # =============================================================================
-# COMPLETION-ONLY COLLATOR (train only on assistant response)
+# COMPLETION-ONLY COLLATOR
 # =============================================================================
 
 RESPONSE_TEMPLATE = "<s>assistant\n"
@@ -81,11 +81,9 @@ class CompletionOnlyCollator:
                 not_found += 1
                 continue
 
-            # Mask everything up to and including the response template
             start_loss = pos + len(self.template_ids)
             labels[i, :start_loss] = self.ignore_index
 
-            # Also mask padding
             if attention_mask is not None:
                 labels[i, attention_mask[i] == 0] = self.ignore_index
 
@@ -105,28 +103,22 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
 FINE_TUNING_DIR = PROJECT_ROOT / "data" / "fine_tuning"
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-merged-qa-clean-mix"
+OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-rag-context-lora"
 
-# QA data (with RS tags) + anti_generic (plain, no tags) + interviews
-INPUT_FILES = {
-    "qa_final": FINE_TUNING_DIR / "qa_rs_final.jsonl",
-    "anti_generic": FINE_TUNING_DIR / "anti_generic_clean.jsonl",
-    "interviews": PROCESSED_DIR / "interviews.jsonl",
-}
+INPUT_FILE = FINE_TUNING_DIR / "qa_with_rag_context.jsonl"
 
 MODEL_NAME = "./models/vikhr-book-merged"
-MAX_SEQ_LENGTH = 1024
+MAX_SEQ_LENGTH = 2048  # longer to fit docs in system prompt
 
-# ALL 7 modules (attention + MLP)
+# LoRA config
 LORA_R = 8
-LORA_ALPHA = 16  # ratio 2
+LORA_ALPHA = 24
 LORA_DROPOUT = 0.0
-TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]  # attention + gate for content control
 
 # Training
 BATCH_SIZE = 1
-GRADIENT_ACCUMULATION = 16  # effective batch = 16
+GRADIENT_ACCUMULATION = 16
 LEARNING_RATE = 5e-5
 NUM_EPOCHS = 20
 WARMUP_RATIO = 0.05
@@ -135,119 +127,51 @@ RANDOM_SEED = 42
 
 RESUME_FROM_CHECKPOINT = False
 
-# System prompt for Labkovsky persona
-SYSTEM_PROMPT = (
-    "Ты — психолог Михаил Лабковский. "
-    "Отвечай в его стиле: прямо, уверенно, с конкретными рекомендациями. "
-    "Используй простой язык и жизненные примеры."
-)
-
 
 # =============================================================================
 # DATA LOADING
 # =============================================================================
 
-def iter_jsonl(path: Path):
-    with open(path, "r", encoding="utf-8") as f:
+def load_data(input_file: Path) -> List[dict]:
+    records = []
+    with open(input_file, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                yield json.loads(line)
+                obj = json.loads(line)
+                if obj.get("question") and obj.get("answer") and obj.get("system_prompt"):
+                    records.append(obj)
             except json.JSONDecodeError:
                 continue
-
-
-def load_all_data(input_files: Dict[str, Path]) -> List[dict]:
-    """Load data from all sources."""
-    records: List[dict] = []
-    print("\nLoading data...")
-
-    for src, fp in input_files.items():
-        if not fp.exists():
-            print(f"  WARNING: {fp} not found — skipping")
-            continue
-
-        cnt = 0
-        for obj in iter_jsonl(fp):
-            # qa_rs_final.jsonl: {"id": ..., "question": ..., "answer_segmented": ...}
-            if "question" in obj and "answer_segmented" in obj:
-                q = obj.get("question")
-                a = obj.get("answer_segmented")
-                rec_id = obj.get("id", "")
-                if isinstance(q, str) and isinstance(a, str) and q.strip() and a.strip():
-                    records.append({
-                        "question": q.strip(),
-                        "answer": a.strip(),
-                        "source": src,
-                        "id": rec_id
-                    })
-                    cnt += 1
-                continue
-
-            # interviews.jsonl: {"question": ..., "answer": ...}
-            if "question" in obj and "answer" in obj:
-                q = obj.get("question")
-                a = obj.get("answer")
-                if isinstance(q, str) and isinstance(a, str) and q.strip() and a.strip():
-                    records.append({
-                        "question": q.strip(),
-                        "answer": a.strip(),
-                        "source": src,
-                        "id": obj.get("id", "")
-                    })
-                    cnt += 1
-                continue
-
-        print(f"  {src} ({fp.name}): {cnt} examples")
-
-    print(f"Total: {len(records)} examples")
+    print(f"Loaded {len(records)} records from {input_file.name}")
     return records
 
 
 def split_by_unique_answers(records: List[dict], val_ratio: float, seed: int):
-    """
-    Split ALL data by UNIQUE ANSWERS to prevent data leakage.
-    """
-    # Group ALL records by answer
     answer_groups = defaultdict(list)
     for r in records:
         answer_groups[r["answer"]].append(r)
 
-    # Convert to list of groups
     groups = list(answer_groups.values())
-
-    # Shuffle groups
     random.seed(seed)
     random.shuffle(groups)
 
-    # Calculate split point (15% eval)
     n_eval_groups = max(1, int(len(groups) * val_ratio))
-
-    # Split groups
     eval_groups = groups[:n_eval_groups]
     train_groups = groups[n_eval_groups:]
 
-    # Flatten back to records
     train_records = [r for g in train_groups for r in g]
     eval_records = [r for g in eval_groups for r in g]
 
-    # Shuffle within sets
     random.shuffle(train_records)
     random.shuffle(eval_records)
 
-    print(f"\nSplit by unique answers (85/15):")
+    print(f"\nSplit by unique answers:")
     print(f"  Total unique answers: {len(groups)}")
     print(f"  Train: {len(train_groups)} groups -> {len(train_records)} records")
     print(f"  Eval: {len(eval_groups)} groups -> {len(eval_records)} records")
-
-    # Print eval IDs (for testing non-memorized samples)
-    eval_ids = [r.get("id", "") for r in eval_records if r.get("id")]
-    print(f"\nEval IDs ({len(eval_ids)} samples):")
-    print(eval_ids[:50])  # Print first 50
-    if len(eval_ids) > 50:
-        print(f"  ... and {len(eval_ids) - 50} more")
 
     return train_records, eval_records
 
@@ -257,14 +181,15 @@ def split_by_unique_answers(records: List[dict], val_ratio: float, seed: int):
 # =============================================================================
 
 def format_for_sft(examples, tokenizer):
-    """Format using Vikhr's native chat template with system prompt."""
+    """Format with RAG context in system prompt — matching inference."""
     texts = []
     for i in range(len(examples["question"])):
         q = examples["question"][i]
         a = examples["answer"][i]
+        sys_prompt = examples["system_prompt"][i]
 
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": q},
             {"role": "assistant", "content": a},
         ]
@@ -285,12 +210,9 @@ def format_for_sft(examples, tokenizer):
 
 def main():
     print("=" * 60)
-    print("Labkovsky Fine-tuning (ALL MODULES on MERGED BASE)")
-    print("Base: vikhr-book-merged (has book vocabulary)")
-    print("Modules: q,k,v,o_proj + gate,up,down_proj (all 7)")
-    print("Data: QA only (no book)")
-    print("Split by UNIQUE ANSWERS (no data leakage)")
-    print("COMPLETION-ONLY training")
+    print("Labkovsky Fine-tuning WITH RAG CONTEXT")
+    print("Training format matches inference format")
+    print("System prompt includes retrieved documents")
     print("=" * 60)
 
     if not torch.cuda.is_available():
@@ -299,27 +221,26 @@ def main():
     print(f"CUDA: {torch.cuda.get_device_name(0)}")
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     print(f"VRAM: {vram_gb:.1f} GB")
-    print(f"BF16: {'supported' if is_bfloat16_supported() else 'not supported'}")
 
-    # Load records
-    records = load_all_data(INPUT_FILES)
+    if not INPUT_FILE.exists():
+        print(f"\nERROR: {INPUT_FILE} not found!")
+        print("Run first: python src/fine_tuning/build_rag_training_data.py")
+        return
 
+    records = load_data(INPUT_FILE)
     if not records:
         print("No data found!")
         return
 
-    # Split by unique answers
     train_records, eval_records = split_by_unique_answers(
-        records,
-        val_ratio=VAL_RATIO,
-        seed=RANDOM_SEED
+        records, val_ratio=VAL_RATIO, seed=RANDOM_SEED
     )
 
     train_ds = Dataset.from_list(train_records)
     eval_ds = Dataset.from_list(eval_records)
 
     # Model + tokenizer
-    print(f"\nLoading model with Unsloth: {MODEL_NAME}")
+    print(f"\nLoading model: {MODEL_NAME}")
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_NAME,
         max_seq_length=MAX_SEQ_LENGTH,
@@ -336,9 +257,8 @@ def main():
     if hasattr(tokenizer, "add_eos_token"):
         tokenizer.add_eos_token = False
 
-    # ALL 7 MODULES LoRA
-    print(f"\nPreparing ALL-MODULES LoRA: r={LORA_R}, alpha={LORA_ALPHA}")
-    print(f"  Target modules: {TARGET_MODULES}")
+    # LoRA
+    print(f"\nPreparing LoRA: r={LORA_R}, alpha={LORA_ALPHA}")
     model = FastLanguageModel.get_peft_model(
         model,
         r=LORA_R,
@@ -355,14 +275,16 @@ def main():
     model.print_trainable_parameters()
 
     # Format data
-    print("\nFormatting dataset with chat template + system prompt...")
+    print("\nFormatting dataset (system prompt with RAG docs)...")
     train_ds = train_ds.map(lambda ex: format_for_sft(ex, tokenizer), batched=True)
     eval_ds = eval_ds.map(lambda ex: format_for_sft(ex, tokenizer), batched=True)
 
-    print("\nSample (first 500 chars):")
-    print(train_ds[0]["text"][:500])
+    # Check token lengths
+    sample_tokens = tokenizer(train_ds[0]["text"], return_tensors="pt")["input_ids"].shape[-1]
+    print(f"\nSample token length: {sample_tokens}")
+    print(f"Sample (first 500 chars):\n{train_ds[0]['text'][:500]}")
 
-    # Completion-only collator
+    # Collator
     collator = CompletionOnlyCollator(tokenizer=tokenizer)
 
     # Trainer config
@@ -379,7 +301,7 @@ def main():
         logging_steps=10,
         eval_strategy="epoch",
         save_strategy="epoch",
-        save_total_limit=5,
+        save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -392,7 +314,6 @@ def main():
         dataset_kwargs={"add_special_tokens": False},
     )
 
-    # Build trainer
     try:
         trainer = SFTTrainer(
             model=model,
@@ -417,11 +338,10 @@ def main():
     print("\nStarting training...")
     print(f"  Base model: {MODEL_NAME}")
     print(f"  LoRA: r={LORA_R}, alpha={LORA_ALPHA}")
-    print(f"  Modules: {TARGET_MODULES} (ALL 7)")
+    print(f"  Modules: {TARGET_MODULES}")
+    print(f"  Max seq length: {MAX_SEQ_LENGTH}")
     print(f"  Batch effective: {BATCH_SIZE * GRADIENT_ACCUMULATION}")
-    print(f"  LR: {LEARNING_RATE}, scheduler: cosine, warmup: {WARMUP_RATIO}")
-    print(f"  Epochs: {NUM_EPOCHS}, early stopping patience: 2")
-    print(f"  Split: by UNIQUE ANSWERS (no leakage)")
+    print(f"  LR: {LEARNING_RATE}, early stopping patience: 2")
     print(f"  Output: {OUTPUT_DIR}")
 
     if RESUME_FROM_CHECKPOINT:

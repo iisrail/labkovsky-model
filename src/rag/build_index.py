@@ -34,17 +34,17 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 # Files to index
 TARGET_FILES = {
-    "qa_corpus": DATA_DIR / "qa_rs_final.jsonl",  # Segmented answers with RS markers
+    "qa_corpus": DATA_DIR / "qa_clean.jsonl",
     "articles": PROCESSED_DIR / "articles_with_questions.jsonl",
+    "interviews": PROCESSED_DIR / "interviews.jsonl",
+    "book": PROCESSED_DIR / "Hochu_i_budu_with_questions.jsonl",
 }
 
 # Embedding model
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 
-# Fields for embedding
-TEXT_FIELDS = ["text", "answer"]  # For embedding (semantic matching)
-QUERY_FIELDS = ["potential_questions", "question"]  # For embedding (semantic matching)
-ANSWER_FIELD = "answer"  # For document content (what model sees)
+# Embed questions only — matches user queries better at inference
+QUERY_FIELDS = ["question", "potential_questions"]
 
 # ============================================================
 # DATA LOADING
@@ -64,7 +64,7 @@ def load_jsonl(filepath: Path) -> list[dict]:
 
 
 def extract_text_for_embedding(record: dict) -> str:
-    """Extract text for embedding (questions + content for semantic matching)."""
+    """Extract questions only for embedding — matches user queries at inference."""
     parts = []
 
     for field in QUERY_FIELDS:
@@ -75,22 +75,18 @@ def extract_text_for_embedding(record: dict) -> str:
             elif isinstance(value, str) and value.strip():
                 parts.append(value)
 
-    for field in TEXT_FIELDS:
-        if field in record:
-            value = record[field]
-            if isinstance(value, str) and value.strip():
-                parts.append(value)
+    # Fallback: if no question fields, use text (for records without questions)
+    if not parts:
+        text = record.get("text", record.get("answer", ""))
+        if text:
+            parts.append(text)
 
     return " ".join(parts)
 
 
 def extract_answer_for_document(record: dict) -> str:
-    """Extract answer only for document content (what model sees for generation).
-
-    Uses 'answer_segmented' if available (has RS structure markers).
-    """
-    # Prefer segmented answer with RS markers for structured RAG
-    return record.get("answer_segmented", record.get(ANSWER_FIELD, record.get("text", "")))
+    """Extract answer for document content (what model sees for generation)."""
+    return record.get("answer", record.get("text", ""))
 
 
 def extract_metadata(record: dict, source_file: str) -> dict:

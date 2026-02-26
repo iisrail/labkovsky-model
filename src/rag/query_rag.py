@@ -34,14 +34,15 @@ MODELS_DIR = PROJECT_DIR / "models"
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 LLM_MODEL_NAME = "./models/vikhr-book-merged"
-LORA_PATH = MODELS_DIR / "labkovsky-merged-base-qa-lora"
+LORA_PATH = MODELS_DIR / "labkovsky-rag-context-lora"
 
 # System prompt template - docs will be inserted
 SYSTEM_PROMPT_TEMPLATE = (
     "Ты психолог Михаил Лабковский. Используй следующие документы для ответа:\n\n"
     "{docs}\n\n"
     "Отвечай в стиле Лабковского: прямо, уверенно, с конкретными рекомендациями. "
-    "Применяй подход из документов к конкретной ситуации пользователя."
+    "Сначала объясни причину проблемы, затем дай конкретные шаги для решения. "
+    "Если видишь, что кому-то в ситуации нужна профессиональная помощь — скажи об этом прямо."
 )
 
 # ============================================================
@@ -108,8 +109,8 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
 # RETRIEVAL
 # ============================================================
 
-TOP_K = 2  # Reduced to minimize irrelevant context
-INCLUDE_SIBLINGS = False  # Disabled - was adding noise
+TOP_K = 2
+INCLUDE_SIBLINGS = True
 
 
 def _get_sibling_ids(doc_id: str, metadata: dict) -> list:
@@ -339,7 +340,7 @@ def ask_labkovsky(query: str) -> dict:
             "docs_used": 0,
         }
 
-    best_distance = docs[0]["distance"]
+    best_distance = next((d["distance"] for d in docs if d["distance"] is not None), None)
 
     # Step 2: Use all retrieved docs for richer context
     docs_for_generation = docs
@@ -411,7 +412,8 @@ def main():
             if verbose:
                 dist = result['best_distance']
                 used = result['docs_used']
-                print(f"\n--- Best Distance: {dist:.3f} | Docs used: {used}/{len(result['docs'])} ---")
+                dist_str = f"{dist:.3f}" if dist is not None else "N/A"
+                print(f"\n--- Best Distance: {dist_str} | Docs used: {used}/{len(result['docs'])} ---")
                 print(f"\n--- Retrieved Documents ({len(result['docs'])}) ---")
                 for i, doc in enumerate(result['docs'], 1):
                     meta = doc['metadata']
