@@ -18,7 +18,7 @@ Fine-tuned LLM that replicates Mikhail Labkovsky's psychological consultation st
 
 ## Key Architecture
 ```
-User Question → ChromaDB (top 2 docs + siblings) → System prompt with docs → Vikhr-book-merged + RAG LoRA → Response
+User Question → ChromaDB (2 book/article + 1 QA, with chunk expansion) → System prompt → Vikhr-book-merged + RAG LoRA → Response
 ```
 
 **Two-stage approach:**
@@ -37,7 +37,7 @@ python src/rag/build_index.py
 
 # 3. Build training data with RAG context
 python src/fine_tuning/build_rag_training_data.py
-# Retrieves docs from book/articles/interviews ONLY (not QA — prevents leakage)
+# 2 book/article docs + 1 non-self QA (separate queries, with chunk expansion)
 # Output: qa_with_rag_context.jsonl
 
 # 4. Train RAG context LoRA
@@ -88,20 +88,23 @@ TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]
 
 ## Critical Design Decisions
 
-### Train vs Inference Doc Sources
-- **Training**: Retrieve docs from book/articles/interviews ONLY (prevents QA leakage)
-- **Inference**: Retrieve from ALL sources including QA (best results)
-- Why: If QA answers appear as retrieved docs during training, model learns to copy them verbatim
+### Split Retrieval (matches train and inference)
+Both training and inference use the same retrieval pattern:
+1. **2 docs from book/articles/interviews** (with chunk expansion)
+2. **1 closest QA doc** (separate query)
+- Training: skips self-match QA (same qa_id), distance threshold 0.30
+- Inference: no filtering — closest QA included (often the exact match)
 
 ### Question-Only Embeddings
 - Index embeds `question` and `potential_questions` fields only (not answers)
 - Matches user queries semantically (question→question, not question→answer)
 - Dramatic improvement in retrieval relevance
 
-### Sibling Chunk Expansion
-- At inference: Retrieve chunk N → also fetch N-1 and N+1
-- At training: Fetch up to 2 next chunks within same chapter/article
-- Provides context for chunks that reference previous content
+### Chunk Expansion (same in train and inference)
+- Fetch chunk N → concatenate N+1, N+2 into same doc text
+- Only within same chapter/article (checks `chapter_id`/`article_id`)
+- Provides context for chunks that continue an idea forward
+- Result: `Документ 1: chunk3\nchunk4\nchunk5` (single doc, not separate)
 
 ### System Prompt Format (must match train/inference)
 ```python
@@ -138,9 +141,11 @@ SYSTEM_PROMPT_TEMPLATE = (
 ## RAG Config
 | Setting | Value |
 |---------|-------|
-| TOP_K | 2 |
-| INCLUDE_SIBLINGS | True (N-1, N+1) |
-| MAX_DISTANCE (training) | 0.35 |
+| TOP_K | 2 (book/articles/interviews) |
+| QA docs | 1 (closest, separate query) |
+| Chunk expansion | +2 next chunks, same chapter/article |
+| MAX_DISTANCE (training, book/articles) | 0.35 |
+| QA_MAX_DISTANCE (training) | 0.30 |
 | Embedding model | intfloat/multilingual-e5-large |
 
 ## LoRA Training Config
