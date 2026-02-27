@@ -110,74 +110,51 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
 # ============================================================
 
 TOP_K = 2
-INCLUDE_SIBLINGS = True
+EXPAND_CHUNKS = True  # concatenate next chunks from same chapter/article
 
 
-def _get_sibling_ids(doc_id: str, metadata: dict) -> list:
+def _expand_with_next_chunks(collection, doc_id: str, doc_text: str, metadata: dict, max_extra: int = 2) -> str:
     """
-    Generate IDs for neighboring chunks (N-1, N+1).
-
-    Handles formats like:
-    - "article_id_chunk2" -> ["article_id_chunk1", "article_id_chunk3"]
-    - "video_01_expl" -> [] (Q&A, no siblings)
+    Concatenate up to max_extra next chunks within same chapter/article.
+    Matches build_rag_training_data.py format exactly.
     """
     chunk_id = metadata.get("chunk_id")
     if chunk_id is None:
-        return []
+        return doc_text
 
     try:
         chunk_num = int(chunk_id)
     except (ValueError, TypeError):
-        return []
+        return doc_text
 
-    # Build sibling IDs based on document ID pattern
-    siblings = []
+    group_id = metadata.get("chapter_id") or metadata.get("article_id")
     base_id = doc_id.rsplit("_chunk", 1)[0] if "_chunk" in doc_id else None
 
-    if base_id:
-        # Article/book format: "article_id_chunk2"
-        if chunk_num > 0:
-            siblings.append(f"{base_id}_chunk{chunk_num - 1}")
-        siblings.append(f"{base_id}_chunk{chunk_num + 1}")
+    if not base_id:
+        return doc_text
 
-    return siblings
+    for offset in range(1, max_extra + 1):
+        next_id = f"{base_id}_chunk{chunk_num + offset}"
+        try:
+            next_doc = collection.get(ids=[next_id], include=["documents", "metadatas"])
+            if not next_doc["ids"]:
+                break
+            next_group = (next_doc["metadatas"][0].get("chapter_id")
+                          or next_doc["metadatas"][0].get("article_id"))
+            if next_group != group_id:
+                break
+            doc_text = doc_text + "\n" + next_doc["documents"][0]
+        except Exception:
+            break
 
-
-def _fetch_siblings(collection, doc_ids: list) -> dict:
-    """Fetch documents by IDs from collection."""
-    if not doc_ids:
-        return {}
-
-    try:
-        results = collection.get(
-            ids=doc_ids,
-            include=["documents", "metadatas"]
-        )
-
-        siblings = {}
-        for doc_id, doc, meta in zip(
-            results['ids'],
-            results['documents'],
-            results['metadatas']
-        ):
-            siblings[doc_id] = {
-                "id": doc_id,
-                "text": doc,
-                "metadata": meta,
-                "distance": None,  # Not from similarity search
-                "is_sibling": True
-            }
-        return siblings
-    except Exception:
-        return {}
+    return doc_text
 
 
-def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K, include_siblings: bool = INCLUDE_SIBLINGS) -> list:
+def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K, expand_chunks: bool = EXPAND_CHUNKS) -> list:
     """
-    Retrieve top-k relevant documents from ChromaDB.
-
-    If include_siblings=True, also fetches neighboring chunks (N-1, N+1)
-    for articles/book to provide context for connected chunks.
+    Retrieve documents matching training format:
+    1. Top-k docs from book/articles/interviews (with chunk expansion)
+    2. One closest QA doc (separate query)
 
     Returns list of dicts with 'text', 'metadata', 'distance' keys.
     """
@@ -186,77 +163,54 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K, incl
 
     query_embedding = embed_model.encode(f"query: {query}")
 
+    # Step 1: Retrieve from book/articles/interviews
     results = collection.query(
         query_embeddings=[query_embedding.tolist()],
         n_results=top_k,
+        where={"source_type": {"$in": ["articles", "book", "interviews"]}},
         include=["documents", "metadatas", "distances"]
     )
 
-    if not results['ids'][0]:
-        return []
-
     documents = []
-    seen_ids = set()
-    sibling_ids_to_fetch = []
 
-    for doc_id, doc, meta, dist in zip(
-        results['ids'][0],
-        results['documents'][0],
-        results['metadatas'][0],
-        results['distances'][0]
-    ):
+    if results['ids'][0]:
+        for doc_id, doc_text, meta, dist in zip(
+            results['ids'][0],
+            results['documents'][0],
+            results['metadatas'][0],
+            results['distances'][0]
+        ):
+            # Expand with next chunks (same chapter/article)
+            if expand_chunks:
+                doc_text = _expand_with_next_chunks(collection, doc_id, doc_text, meta)
+
+            documents.append({
+                "id": doc_id,
+                "text": doc_text,
+                "metadata": meta,
+                "distance": dist,
+            })
+
+    # Step 2: Add one closest QA doc
+    qa_results = collection.query(
+        query_embeddings=[query_embedding.tolist()],
+        n_results=1,
+        where={"source_type": {"$eq": "qa_corpus"}},
+        include=["documents", "metadatas", "distances"]
+    )
+
+    if qa_results['ids'][0]:
+        qa_id = qa_results['ids'][0][0]
+        qa_text = qa_results['documents'][0][0]
+        qa_meta = qa_results['metadatas'][0][0]
+        qa_dist = qa_results['distances'][0][0]
+
         documents.append({
-            "id": doc_id,
-            "text": doc,
-            "metadata": meta,
-            "distance": dist,
-            "is_sibling": False
+            "id": qa_id,
+            "text": qa_text,
+            "metadata": qa_meta,
+            "distance": qa_dist,
         })
-        seen_ids.add(doc_id)
-
-        # Collect sibling IDs
-        if include_siblings:
-            for sib_id in _get_sibling_ids(doc_id, meta):
-                if sib_id not in seen_ids:
-                    sibling_ids_to_fetch.append(sib_id)
-                    seen_ids.add(sib_id)
-
-    # Fetch siblings
-    if sibling_ids_to_fetch:
-        siblings = _fetch_siblings(collection, sibling_ids_to_fetch)
-
-        # Insert siblings in correct order (before/after their parent)
-        expanded_docs = []
-        for doc in documents:
-            doc_id = doc["id"]
-            chunk_id = doc["metadata"].get("chunk_id")
-
-            if chunk_id is not None:
-                try:
-                    chunk_num = int(chunk_id)
-                    base_id = doc_id.rsplit("_chunk", 1)[0] if "_chunk" in doc_id else None
-
-                    if base_id:
-                        # Add previous sibling first
-                        prev_id = f"{base_id}_chunk{chunk_num - 1}"
-                        if prev_id in siblings:
-                            expanded_docs.append(siblings[prev_id])
-
-                        # Add main doc
-                        expanded_docs.append(doc)
-
-                        # Add next sibling after
-                        next_id = f"{base_id}_chunk{chunk_num + 1}"
-                        if next_id in siblings:
-                            expanded_docs.append(siblings[next_id])
-                    else:
-                        expanded_docs.append(doc)
-                except (ValueError, TypeError):
-                    expanded_docs.append(doc)
-            else:
-                expanded_docs.append(doc)
-
-        documents = expanded_docs
 
     return documents
 
@@ -340,7 +294,7 @@ def ask_labkovsky(query: str) -> dict:
             "docs_used": 0,
         }
 
-    best_distance = next((d["distance"] for d in docs if d["distance"] is not None), None)
+    best_distance = docs[0]["distance"] if docs else None
 
     # Step 2: Use all retrieved docs for richer context
     docs_for_generation = docs
@@ -368,10 +322,7 @@ def main():
     print("=" * 60)
     print("Labkovsky RAG")
     print("=" * 60)
-    print("\nCommands:")
-    print("  'exit' — quit")
-    print("  'verbose' — toggle source display")
-    print()
+    print("Type 'exit' to quit\n")
 
     # Initialize all components
     print("Loading models...")
@@ -382,8 +333,6 @@ def main():
     init_llm(use_lora=not args.no_lora, lora_path=lora_path)
 
     print("\n[OK] Ready!\n")
-
-    verbose = False
 
     while True:
         try:
@@ -399,32 +348,25 @@ def main():
             print("Poka!")
             break
 
-        if query.lower() == 'verbose':
-            verbose = not verbose
-            print(f"Verbose: {'ON' if verbose else 'OFF'}")
-            continue
-
         print("\n...")
 
         try:
             result = ask_labkovsky(query)
 
-            if verbose:
-                dist = result['best_distance']
-                used = result['docs_used']
-                dist_str = f"{dist:.3f}" if dist is not None else "N/A"
-                print(f"\n--- Best Distance: {dist_str} | Docs used: {used}/{len(result['docs'])} ---")
-                print(f"\n--- Retrieved Documents ({len(result['docs'])}) ---")
-                for i, doc in enumerate(result['docs'], 1):
-                    meta = doc['metadata']
-                    source = meta.get('source_type', 'unknown')
-                    doc_id = doc.get('id', 'unknown')
-                    is_sib = doc.get('is_sibling', False)
-                    sib_tag = " [sibling]" if is_sib else ""
-                    dist_str = f"dist: {doc['distance']:.3f}" if doc['distance'] else "context"
-                    print(f"\n[{i}] {source} | {doc_id} | {dist_str}{sib_tag}")
-                    print(f"    {doc['text'][:300]}...")
-                print(f"\n--- Response ---")
+            dist = result['best_distance']
+            used = result['docs_used']
+            dist_str = f"{dist:.3f}" if dist is not None else "N/A"
+            print(f"\n--- Best Distance: {dist_str} | Docs used: {used}/{len(result['docs'])} ---")
+            print(f"\n--- Retrieved Documents ({len(result['docs'])}) ---")
+            for i, doc in enumerate(result['docs'], 1):
+                meta = doc['metadata']
+                source = meta.get('source_type', 'unknown')
+                doc_id = doc.get('id', 'unknown')
+                dist_str = f"dist: {doc['distance']:.3f}"
+                text_len = len(doc['text'])
+                print(f"\n[{i}] {source} | {doc_id} | {dist_str} | {text_len} chars")
+                print(f"    {doc['text'][:300]}...")
+            print(f"\n--- Response ---")
             print(f"\nLabkovsky: {result['answer']}\n")
         except Exception as e:
             print(f"[ERROR] {e}")

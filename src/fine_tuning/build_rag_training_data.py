@@ -36,6 +36,8 @@ EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 TOP_K = 2
 RETRIEVE_K = 5  # retrieve extra to have enough after filtering
 MAX_DISTANCE = 0.35  # skip docs further than this
+ADD_QA_DOC = True  # add closest non-self QA as extra doc
+QA_MAX_DISTANCE = 0.30  # stricter for QA to avoid noise
 
 # Must match query_rag.py inference format
 SYSTEM_PROMPT_TEMPLATE = (
@@ -150,6 +152,35 @@ def main():
                 "distance": dist,
             })
             if len(docs) >= TOP_K:
+                break
+
+        # Separate QA query: find closest non-self QA
+        if ADD_QA_DOC:
+            qa_results = collection.query(
+                query_embeddings=[query_embedding.tolist()],
+                n_results=5,
+                where={"source_type": {"$eq": "qa_corpus"}},
+                include=["documents", "metadatas", "distances"]
+            )
+            # Find first QA that isn't the same record
+            rec_qa_id = rec_id.rsplit("_", 1)[0] if "_" in rec_id else rec_id
+            for qa_id, qa_text, qa_meta, qa_dist in zip(
+                qa_results['ids'][0],
+                qa_results['documents'][0],
+                qa_results['metadatas'][0],
+                qa_results['distances'][0]
+            ):
+                # Skip self (same qa_id group)
+                qa_qa_id = qa_meta.get("qa_id", qa_id)
+                if qa_qa_id == rec_qa_id or qa_id == rec_id:
+                    continue
+                if qa_dist > QA_MAX_DISTANCE:
+                    break
+                docs.append({
+                    "id": qa_id,
+                    "text": qa_text,
+                    "distance": qa_dist,
+                })
                 break
 
         if not docs:
