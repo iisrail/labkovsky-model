@@ -19,7 +19,7 @@ import re
 import torch
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextStreamer
 from peft import PeftModel
 import chromadb
 
@@ -258,22 +258,23 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
     inputs = tokenizer(prompt, return_tensors="pt").to(llm.device)
     input_len = inputs["input_ids"].shape[-1]
 
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
     with torch.inference_mode():
         outputs = llm.generate(
             **inputs,
             max_new_tokens=512,
             do_sample=True,
-            temperature=0.7,
+            temperature=0.3,
             top_p=0.9,
             repetition_penalty=1.1,
             no_repeat_ngram_size=4,  # Prevent copying 4+ word sequences from RAG
             pad_token_id=tokenizer.eos_token_id,
+            streamer=streamer,
         )
 
     generated_tokens = outputs[0][input_len:]
     response = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-
-    # No stripping — show raw output with RS markers for debugging
 
     return response
 
@@ -366,8 +367,9 @@ def main():
                 text_len = len(doc['text'])
                 print(f"\n[{i}] {source} | {doc_id} | {dist_str} | {text_len} chars")
                 print(f"    {doc['text'][:300]}...")
-            print(f"\n--- Response ---")
-            print(f"\nLabkovsky: {result['answer']}\n")
+            print(f"\n--- Response (streaming) ---\n")
+            # Response already printed by TextStreamer during generation
+            print()  # newline after stream
         except Exception as e:
             print(f"[ERROR] {e}")
             import traceback
