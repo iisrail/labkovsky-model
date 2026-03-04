@@ -31,21 +31,22 @@ User Question → ChromaDB (2 book/article + 1 QA, with chunk expansion) → Sys
 python src/fine_tuning/clean_qa_data.py
 # Input: qa_rs_final.jsonl → Output: qa_clean.jsonl
 
-# 2. Build ChromaDB index (1047 docs)
+# 2. Build ChromaDB index (~1012 docs)
 python src/rag/build_index.py
-# Sources: qa_clean + articles + interviews + book
+# Sources: qa_rs_segmented (with RS markers) + articles + book
 
 # 3. Build training data with RAG context
 python src/fine_tuning/build_rag_training_data.py
 # 2 book/article docs + 1 non-self QA (separate queries, with chunk expansion)
+# Records with no docs are skipped (every training example must have RAG context)
 # Output: qa_with_rag_context.jsonl
 
 # 4. Train RAG context LoRA
 python src/fine_tuning/train_with_rag_context.py
-# Output: models/labkovsky-rag-context-lora
+# Output: models/labkovsky-rag-context-lora-v5
 
 # 5. Query
-python src/rag/query_rag.py
+python src/rag/query_rag.py --lora-path models/labkovsky-rag-context-lora-v5
 python src/rag/query_rag.py --no-lora  # baseline
 ```
 
@@ -77,6 +78,7 @@ python src/rag/query_rag.py --no-lora  # baseline
 - **Question-only embeddings** dramatically improve retrieval quality
 - **RS markers in training data cause hallucination** — model generates wrong markers. Clean at source.
 - **Articles/book chunks hurt direct training** — they're connected, not self-contained Q&A. Use in RAG only.
+- **English system prompt** with doc-type differentiation works better than Russian prompt
 
 ### Current Best Config
 ```python
@@ -90,10 +92,25 @@ TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]
 
 ### Split Retrieval (matches train and inference)
 Both training and inference use the same retrieval pattern:
-1. **2 docs from book/articles/interviews** (with chunk expansion)
-2. **1 closest QA doc** (separate query)
+1. **2 docs from book/articles** (with chunk expansion)
+2. **1 closest QA doc** (separate query, with RS markers for structure)
 - Training: skips self-match QA (same qa_id), distance threshold 0.30
 - Inference: no filtering — closest QA included (often the exact match)
+
+### Doc Type Labels in System Prompt
+Retrieved docs are labeled by type so the model can differentiate their role:
+- `[Book/Article] Doc 1: ...` — core principles, foundation for reasoning
+- `[Пример QA] Документ 3: ...` — tone and format guide
+
+### RS-Segmented QA in RAG (not in training targets)
+- QA docs in the index use `qa_rs_segmented.jsonl` with `[EXPLANATION]`, `[INTERVENTION]`, `[ESCALATION]` markers
+- Model sees structured examples showing response organization in retrieved docs
+- Training targets remain clean (from `qa_clean.jsonl`) — model learns to produce answers without markers
+- This teaches structure implicitly without the model echoing markers
+
+### No-Docs Records Dropped from Training
+- Records where retrieval returns zero docs are skipped during training data build
+- Every training example has RAG context, matching inference (which always has docs)
 
 ### Question-Only Embeddings
 - Index embeds `question` and `potential_questions` fields only (not answers)
@@ -104,16 +121,19 @@ Both training and inference use the same retrieval pattern:
 - Fetch chunk N → concatenate N+1, N+2 into same doc text
 - Only within same chapter/article (checks `chapter_id`/`article_id`)
 - Provides context for chunks that continue an idea forward
-- Result: `Документ 1: chunk3\nchunk4\nchunk5` (single doc, not separate)
+- Result: `[Book/Article] Doc 1: chunk3\nchunk4\nchunk5` (single doc, not separate)
 
 ### System Prompt Format (must match train/inference)
 ```python
 SYSTEM_PROMPT_TEMPLATE = (
-    "Ты психолог Михаил Лабковский. Используй следующие документы для ответа:\n\n"
+    "You are psychologist Mikhail Labkovsky. Below are reference materials.\n\n"
+    "Book and article fragments contain core principles — use them as the foundation "
+    "for your reasoning, but do not copy verbatim.\n"
+    "QA examples show how to structure a response — use them as a guide for tone and format.\n\n"
     "{docs}\n\n"
-    "Отвечай в стиле Лабковского: прямо, уверенно, с конкретными рекомендациями. "
-    "Сначала объясни причину проблемы, затем дай конкретные шаги для решения. "
-    "Если видишь, что кому-то в ситуации нужна профессиональная помощь — скажи об этом прямо."
+    "Answer in Labkovsky's style: direct, confident, with specific recommendations. "
+    "First explain the root cause, then give concrete steps. "
+    "If professional help is needed — say so directly."
 )
 ```
 
@@ -121,27 +141,26 @@ SYSTEM_PROMPT_TEMPLATE = (
 | File | Purpose | Count |
 |------|---------|-------|
 | `qa_rs_final.jsonl` | Raw QA with RS markers (source) | 478 |
-| `qa_clean.jsonl` | Cleaned QA (no RS markers) — for training & index | 478 |
+| `qa_rs_segmented.jsonl` | QA with RS markers (`answer` field) — for RAG index | 479 |
+| `qa_clean.jsonl` | Cleaned QA (no RS markers) — for training targets | 478 |
 | `anti_generic_finance.jsonl` | Boundary examples (finance→psychology) | 7 |
 | `anti_generic_clean.jsonl` | Boundary examples (generic) | 128 |
-| `interviews.jsonl` | Interview Q&A | 35 |
 | `articles_with_questions.jsonl` | RAG index only (connected chunks) | ~250 |
 | `Hochu_i_budu_with_questions.jsonl` | RAG index only (book chapters) | ~284 |
-| `qa_with_rag_context.jsonl` | Training data with RAG docs in system prompt | ~485 |
+| `qa_with_rag_context.jsonl` | Training data with RAG docs in system prompt | ~462 |
 
-### ChromaDB Index: 1047 documents
-- 478 qa_corpus + ~250 articles + 35 interviews + ~284 book
+### ChromaDB Index: ~1012 documents
+- 479 qa_corpus (with RS markers) + ~250 articles + ~284 book
 
-### RS Markers (stripped from training, kept in raw data)
-- `[ОБЪЯСНЕНИЕ]` - Psychology/explanation
-- `[ВМЕШАТЕЛЬСТВО]` - Intervention/advice
-- `[ЭСКАЛАЦИЯ]` - Professional help needed
-- `Не требуется.` stubs also stripped
+### RS Markers (in RAG QA docs, stripped from training targets)
+- `[EXPLANATION]` - Psychology/explanation
+- `[INTERVENTION]` - Intervention/advice
+- `[ESCALATION]` - Professional help needed
 
 ## RAG Config
 | Setting | Value |
 |---------|-------|
-| TOP_K | 2 (book/articles/interviews) |
+| TOP_K | 2 (book/articles) |
 | QA docs | 1 (closest, separate query) |
 | Chunk expansion | +2 next chunks, same chapter/article |
 | MAX_DISTANCE (training, book/articles) | 0.35 |
@@ -170,11 +189,14 @@ SYSTEM_PROMPT_TEMPLATE = (
 - Small LoRA (r=8) with attention + gate_proj
 - Completion-only training (prevents generating user questions)
 - Docs in system prompt (matching train/inference format)
+- English system prompt with doc-role differentiation
+- Doc type labels (`[Book/Article]` / `[QA Example]`) in retrieved docs
+- RS-segmented QA in RAG index (structure guide), clean targets in training
 - Training retrieval from book/articles only (prevents QA leakage)
 - Inference retrieval from all sources
 - Question-only embeddings for index
 - Sibling chunk expansion for connected content
-- Distance threshold (0.35) with no-docs fallback
+- Dropping no-docs records from training
 
 ### Doesn't Work
 - Full sequence training (model generates user questions)
@@ -182,15 +204,17 @@ SYSTEM_PROMPT_TEMPLATE = (
 - Complex prompts with RS instructions (echoes markers)
 - Large LoRA (breaks RAG grounding)
 - Connected chunks for direct training (articles, book)
-- RS markers in training data (model hallucinates wrong markers)
+- RS markers in training data targets (model hallucinates wrong markers)
 - QA answers in training retrieval (model copies verbatim)
 - Vikhr native `documents` role for advice (works for factual, not advice style)
+- Interviews in RAG index (not useful)
+- No-docs fallback prompt in training (mismatch with inference)
 
 ## Project Structure
 ```
 src/
 ├── fine_tuning/
-│   ├── train_with_rag_context.py    # Current training (RAG context LoRA)
+│   ├── train_with_rag_context.py    # Current training (RAG context LoRA) → v5
 │   ├── train_lora_unsloth.py        # Previous training (direct LoRA)
 │   ├── build_rag_training_data.py   # Build training data with RAG docs
 │   ├── clean_qa_data.py             # Strip RS markers from QA data
@@ -201,17 +225,17 @@ src/
 data/
 ├── fine_tuning/
 │   ├── qa_rs_final.jsonl            # Raw QA (RS markers)
-│   ├── qa_clean.jsonl               # Cleaned QA (no markers)
+│   ├── qa_rs_segmented.jsonl        # QA with RS markers — for RAG index
+│   ├── qa_clean.jsonl               # Cleaned QA (no markers) — training targets
 │   ├── qa_with_rag_context.jsonl    # Training data with RAG context
 │   ├── anti_generic_finance.jsonl   # Finance boundaries
 │   └── anti_generic_clean.jsonl     # Generic boundaries
 ├── processed/
-│   ├── interviews.jsonl             # Interview Q&A
 │   ├── articles_with_questions.jsonl  # RAG only
 │   └── Hochu_i_budu_with_questions.jsonl  # RAG only
 models/
 ├── vikhr-book-merged/               # Base + book LoRA merged
-└── labkovsky-rag-context-lora/      # Current RAG context adapter
+└── labkovsky-rag-context-lora-v5/   # Current RAG context adapter
 ```
 
 ## Commands
@@ -224,7 +248,7 @@ python src/fine_tuning/build_rag_training_data.py
 python src/fine_tuning/train_with_rag_context.py
 
 # Query
-python src/rag/query_rag.py
+python src/rag/query_rag.py --lora-path models/labkovsky-rag-context-lora-v5
 python src/rag/query_rag.py --no-lora  # baseline
 ```
 

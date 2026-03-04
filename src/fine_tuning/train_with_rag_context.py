@@ -103,7 +103,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
 FINE_TUNING_DIR = PROJECT_ROOT / "data" / "fine_tuning"
-OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-rag-context-lora"
+OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-rag-context-lora-v5"
 
 INPUT_FILE = FINE_TUNING_DIR / "qa_with_rag_context.jsonl"
 

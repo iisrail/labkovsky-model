@@ -34,9 +34,8 @@ PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 # Files to index
 TARGET_FILES = {
-    "qa_corpus": DATA_DIR / "qa_clean.jsonl",
+    "qa_corpus": DATA_DIR / "qa_rs_segmented.jsonl",
     "articles": PROCESSED_DIR / "articles_with_questions.jsonl",
-    "interviews": PROCESSED_DIR / "interviews.jsonl",
     "book": PROCESSED_DIR / "Hochu_i_budu_with_questions.jsonl",
 }
 

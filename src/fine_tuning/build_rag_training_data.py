@@ -41,18 +41,14 @@ QA_MAX_DISTANCE = 0.30  # stricter for QA to avoid noise
 
 # Must match query_rag.py inference format
 SYSTEM_PROMPT_TEMPLATE = (
-    "Ты психолог Михаил Лабковский. Используй следующие документы для ответа:\n\n"
+    "You are psychologist Mikhail Labkovsky. Below are reference materials.\n\n"
+    "Book and article fragments contain core principles — use them as the foundation "
+    "for your reasoning, but do not copy verbatim.\n"
+    "QA examples show how to structure a response — use them as a guide for tone and format.\n\n"
     "{docs}\n\n"
-    "Отвечай в стиле Лабковского: прямо, уверенно, с конкретными рекомендациями. "
-    "Сначала объясни причину проблемы, затем дай конкретные шаги для решения. "
-    "Если видишь, что кому-то в ситуации нужна профессиональная помощь — скажи об этом прямо."
-)
-
-NO_DOCS_PROMPT = (
-    "Ты психолог Михаил Лабковский. "
-    "Отвечай в стиле Лабковского: прямо, уверенно, с конкретными рекомендациями. "
-    "Сначала объясни причину проблемы, затем дай конкретные шаги для решения. "
-    "Если видишь, что кому-то в ситуации нужна профессиональная помощь — скажи об этом прямо."
+    "Answer in Labkovsky's style: direct, confident, with specific recommendations. "
+    "First explain the root cause, then give concrete steps. "
+    "If professional help is needed — say so directly."
 )
 
 
@@ -100,7 +96,7 @@ def main():
         results = collection.query(
             query_embeddings=[query_embedding.tolist()],
             n_results=RETRIEVE_K,
-            where={"source_type": {"$in": ["articles", "book", "interviews"]}},
+            where={"source_type": {"$in": ["articles", "book"]}},
             include=["documents", "metadatas", "distances"]
         )
 
@@ -150,6 +146,7 @@ def main():
                 "id": doc_id,
                 "text": doc_text,
                 "distance": dist,
+                "type": "book_article",
             })
             if len(docs) >= TOP_K:
                 break
@@ -180,18 +177,20 @@ def main():
                     "id": qa_id,
                     "text": qa_text,
                     "distance": qa_dist,
+                    "type": "qa",
                 })
                 break
 
         if not docs:
             no_docs_count += 1
-            system_prompt = NO_DOCS_PROMPT
-        else:
-            docs_text = "\n\n".join([
-                f"Документ {j+1}: {d['text']}"
-                for j, d in enumerate(docs)
-            ])
-            system_prompt = SYSTEM_PROMPT_TEMPLATE.format(docs=docs_text)
+            continue  # skip records with no docs — inference always has RAG context
+
+        docs_text = "\n\n".join([
+            f"[Book/Article] Doc {j+1}: {d['text']}" if d["type"] == "book_article"
+            else f"[QA Example] Doc {j+1}: {d['text']}"
+            for j, d in enumerate(docs)
+        ])
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(docs=docs_text)
 
         output_records.append({
             "id": rec_id,
@@ -211,7 +210,7 @@ def main():
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     print(f"\nDone: {len(output_records)} records -> {OUTPUT_FILE.name}")
-    print(f"  Records with no docs (self was only match): {no_docs_count}")
+    print(f"  Records skipped (no docs retrieved): {no_docs_count}")
 
     # Show example
     if output_records:

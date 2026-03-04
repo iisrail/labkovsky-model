@@ -17,9 +17,10 @@ import argparse
 import json
 import re
 import torch
+from datetime import datetime
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TextStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 import chromadb
 
@@ -35,14 +36,18 @@ MODELS_DIR = PROJECT_DIR / "models"
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 LLM_MODEL_NAME = "./models/vikhr-book-merged"
 LORA_PATH = MODELS_DIR / "labkovsky-rag-context-lora"
+EVAL_LOG_PATH = PROJECT_DIR / "data" / "eval_log.jsonl"
 
 # System prompt template - docs will be inserted
 SYSTEM_PROMPT_TEMPLATE = (
-    "Ты психолог Михаил Лабковский. Используй следующие документы для ответа:\n\n"
+    "You are psychologist Mikhail Labkovsky. Below are reference materials.\n\n"
+    "Book and article fragments contain core principles — use them as the foundation "
+    "for your reasoning, but do not copy verbatim.\n"
+    "QA examples show how to structure a response — use them as a guide for tone and format.\n\n"
     "{docs}\n\n"
-    "Отвечай в стиле Лабковского: прямо, уверенно, с конкретными рекомендациями. "
-    "Сначала объясни причину проблемы, затем дай конкретные шаги для решения. "
-    "Если видишь, что кому-то в ситуации нужна профессиональная помощь — скажи об этом прямо."
+    "Answer in Labkovsky's style: direct, confident, with specific recommendations. "
+    "First explain the root cause, then give concrete steps. "
+    "If professional help is needed — say so directly."
 )
 
 # ============================================================
@@ -70,6 +75,36 @@ def init_retrieval(chroma_dir: Path):
         print(f"   Loaded {_collection.count()} documents")
     return _collection
 
+def _resolve_best_checkpoint(lora_path: Path) -> Path:
+    """Find best checkpoint by reading trainer_state.json, fall back to lora_path itself."""
+    # If already pointing to a checkpoint dir, use as-is
+    if lora_path.name.startswith("checkpoint-"):
+        return lora_path
+
+    # Look for trainer_state.json in checkpoint dirs
+    checkpoints = sorted(lora_path.glob("checkpoint-*/trainer_state.json"))
+    if not checkpoints:
+        return lora_path
+
+    # Read the latest trainer_state (has full history and best_model_checkpoint)
+    try:
+        state = json.loads(checkpoints[-1].read_text())
+        best_path = state.get("best_model_checkpoint")
+        if best_path:
+            best_path = Path(best_path)
+            # Handle absolute paths that may differ between machines
+            if not best_path.exists():
+                best_path = lora_path / best_path.name
+            if best_path.exists():
+                best_metric = state.get("best_metric", "?")
+                print(f"   Best checkpoint: {best_path.name} (eval_loss={best_metric})")
+                return best_path
+    except (json.JSONDecodeError, KeyError):
+        pass
+
+    return lora_path
+
+
 def init_llm(use_lora: bool = True, lora_path: Path = None):
     global _llm, _tokenizer
     if _llm is None:
@@ -94,6 +129,7 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
         )
 
         if use_lora and lora_path and lora_path.exists():
+            lora_path = _resolve_best_checkpoint(lora_path)
             print(f"   Loading LoRA: {lora_path}")
             _llm = PeftModel.from_pretrained(base_model, str(lora_path))
         else:
@@ -167,7 +203,7 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K, expa
     results = collection.query(
         query_embeddings=[query_embedding.tolist()],
         n_results=top_k,
-        where={"source_type": {"$in": ["articles", "book", "interviews"]}},
+        where={"source_type": {"$in": ["articles", "book"]}},
         include=["documents", "metadatas", "distances"]
     )
 
@@ -235,9 +271,15 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
     """
     llm, tokenizer = init_llm(use_lora=use_lora, lora_path=lora_path)
 
-    # Format documents as text for system prompt
+    # Format documents as text for system prompt with type labels
+    def _doc_label(doc):
+        st = doc.get("metadata", {}).get("source_type", "")
+        if st == "qa_corpus":
+            return "[QA Example]"
+        return "[Book/Article]"
+
     docs_text = "\n\n".join([
-        f"Документ {i+1}: {doc['text']}"
+        f"{_doc_label(doc)} Документ {i+1}: {doc['text']}"
         for i, doc in enumerate(context_docs)
     ])
 
@@ -258,19 +300,26 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
     inputs = tokenizer(prompt, return_tensors="pt").to(llm.device)
     input_len = inputs["input_ids"].shape[-1]
 
-    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    # Stop generation at EOS or start of a new user turn
+    stop_token_ids = tokenizer.encode("<s>user\n", add_special_tokens=False)
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class StopOnUserTurn(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs):
+            if len(input_ids[0]) >= len(stop_token_ids):
+                return input_ids[0][-len(stop_token_ids):].tolist() == stop_token_ids
+            return False
 
     with torch.inference_mode():
         outputs = llm.generate(
             **inputs,
             max_new_tokens=512,
             do_sample=True,
-            temperature=0.3,
-            top_p=0.9,
+            temperature=0.5,
+            top_p=0.85,
             repetition_penalty=1.1,
-            no_repeat_ngram_size=4,  # Prevent copying 4+ word sequences from RAG
             pad_token_id=tokenizer.eos_token_id,
-            streamer=streamer,
+            stopping_criteria=StoppingCriteriaList([StopOnUserTurn()]),
         )
 
     generated_tokens = outputs[0][input_len:]
@@ -295,6 +344,7 @@ def ask_labkovsky(query: str) -> dict:
             "docs_used": 0,
         }
 
+    docs.sort(key=lambda d: d["distance"])
     best_distance = docs[0]["distance"] if docs else None
 
     # Step 2: Use all retrieved docs for richer context
@@ -313,17 +363,42 @@ def ask_labkovsky(query: str) -> dict:
 # CLI
 # ============================================================
 
+def log_eval(model_path: str, query: str, answer: str, docs: list, notes: str):
+    """Append evaluation entry to eval log."""
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "model": model_path,
+        "question": query,
+        "answer": answer,
+        "docs_used": len(docs),
+        "best_distance": docs[0]["distance"] if docs else None,
+        "doc_ids": [d["id"] for d in docs],
+        "notes": notes,
+    }
+    EVAL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(EVAL_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    print(f"[saved to {EVAL_LOG_PATH.name}]")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--chroma-dir", type=str, default=str(CHROMA_DIR), help="ChromaDB directory")
     parser.add_argument("--lora-path", type=str, default=str(LORA_PATH), help="LoRA adapter path")
     parser.add_argument("--no-lora", action="store_true", help="Use base model without LoRA")
+    parser.add_argument("--verbose", action="store_true", help="Show retrieved RAG documents")
+    parser.add_argument("--no-log", action="store_true", help="Disable eval logging")
     args = parser.parse_args()
 
     print("=" * 60)
     print("Labkovsky RAG")
     print("=" * 60)
-    print("Type 'exit' to quit\n")
+    print("Type 'exit' to quit, 'verbose' to toggle RAG docs display")
+    if not args.no_log:
+        print("After each answer, enter notes (or press Enter to skip)")
+    print()
+
+    verbose = args.verbose
 
     # Initialize all components
     print("Loading models...")
@@ -331,9 +406,18 @@ def main():
     init_retrieval(Path(args.chroma_dir))
 
     lora_path = None if args.no_lora else Path(args.lora_path)
+    resolved_lora = _resolve_best_checkpoint(lora_path) if lora_path else None
     init_llm(use_lora=not args.no_lora, lora_path=lora_path)
 
-    print("\n[OK] Ready!\n")
+    if args.no_lora:
+        model_label = "base-no-lora"
+    else:
+        try:
+            model_label = str(resolved_lora.relative_to(PROJECT_DIR))
+        except ValueError:
+            model_label = str(resolved_lora)
+    print(f"\nModel: {model_label}")
+    print("[OK] Ready!\n")
 
     while True:
         try:
@@ -349,6 +433,11 @@ def main():
             print("Poka!")
             break
 
+        if query.lower() == 'verbose':
+            verbose = not verbose
+            print(f"Verbose: {'ON' if verbose else 'OFF'}")
+            continue
+
         print("\n...")
 
         try:
@@ -358,18 +447,27 @@ def main():
             used = result['docs_used']
             dist_str = f"{dist:.3f}" if dist is not None else "N/A"
             print(f"\n--- Best Distance: {dist_str} | Docs used: {used}/{len(result['docs'])} ---")
-            print(f"\n--- Retrieved Documents ({len(result['docs'])}) ---")
-            for i, doc in enumerate(result['docs'], 1):
-                meta = doc['metadata']
-                source = meta.get('source_type', 'unknown')
-                doc_id = doc.get('id', 'unknown')
-                dist_str = f"dist: {doc['distance']:.3f}"
-                text_len = len(doc['text'])
-                print(f"\n[{i}] {source} | {doc_id} | {dist_str} | {text_len} chars")
-                print(f"    {doc['text'][:300]}...")
-            print(f"\n--- Response (streaming) ---\n")
-            # Response already printed by TextStreamer during generation
-            print()  # newline after stream
+            if verbose:
+                print(f"\n--- Retrieved Documents ({len(result['docs'])}) ---")
+                for i, doc in enumerate(result['docs'], 1):
+                    meta = doc['metadata']
+                    source = meta.get('source_type', 'unknown')
+                    doc_id = doc.get('id', 'unknown')
+                    dist_str = f"dist: {doc['distance']:.3f}"
+                    text_len = len(doc['text'])
+                    print(f"\n[{i}] {source} | {doc_id} | {dist_str} | {text_len} chars")
+                    print(f"    {doc['text'][:300]}...")
+            print(f"\nЛабковский: {result['answer']}\n")
+
+            # Eval logging
+            if not args.no_log:
+                try:
+                    notes = input("Notes (Enter to skip): ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    notes = ""
+                if notes:
+                    log_eval(model_label, query, result["answer"], result["docs"], notes)
+
         except Exception as e:
             print(f"[ERROR] {e}")
             import traceback
