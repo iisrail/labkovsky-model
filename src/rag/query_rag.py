@@ -147,6 +147,21 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
 
 TOP_K = 2
 EXPAND_CHUNKS = True  # concatenate next chunks from same chapter/article
+QA_MIN_DISTANCE = 0.25  # skip QA docs closer than this — too close means near-exact match, model copies details
+
+# decision_type → short topic label (must match build_rag_training_data.py)
+DT_TOPIC = {
+    "SELF_ESTEEM_CORRECTIVE": "self-esteem",
+    "EXPLANATION": "explanation",
+    "DEPENDENCY_BOUNDARIES": "boundaries",
+    "ANXIETY_MANAGEMENT": "anxiety",
+    "ADDICTION_PATTERN": "addiction",
+    "CLINICAL_ESCALATION": "escalation",
+    "AFFECTIVE_ADDICTION": "affective addiction",
+    "PARENTING_MODEL": "parenting",
+    "FEAR_SCENARIO_COPING": "fear coping",
+    "PARENTING_LIMITS": "parenting limits",
+}
 
 
 def _expand_with_next_chunks(collection, doc_id: str, doc_text: str, metadata: dict, max_extra: int = 2) -> str:
@@ -227,26 +242,36 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K, expa
                 "distance": dist,
             })
 
-    # Step 2: Add one closest QA doc
+    # Step 2: Add one QA doc (skip too-close matches, take next-best)
     qa_results = collection.query(
         query_embeddings=[query_embedding.tolist()],
-        n_results=1,
+        n_results=5,
         where={"source_type": {"$eq": "qa_corpus"}},
         include=["documents", "metadatas", "distances"]
     )
 
     if qa_results['ids'][0]:
-        qa_id = qa_results['ids'][0][0]
-        qa_text = qa_results['documents'][0][0]
-        qa_meta = qa_results['metadatas'][0][0]
-        qa_dist = qa_results['distances'][0][0]
+        for qa_id, qa_text, qa_meta, qa_dist in zip(
+            qa_results['ids'][0], qa_results['documents'][0],
+            qa_results['metadatas'][0], qa_results['distances'][0]
+        ):
+            if qa_dist < QA_MIN_DISTANCE:
+                print(f"   [QA skip] {qa_id} dist={qa_dist:.3f} < {QA_MIN_DISTANCE} (too close)")
+                continue
 
-        documents.append({
-            "id": qa_id,
-            "text": qa_text,
-            "metadata": qa_meta,
-            "distance": qa_dist,
-        })
+            # Add topic hint from decision_type (matches training format)
+            qa_dt = qa_meta.get("decision_type", "")
+            topic = DT_TOPIC.get(qa_dt, "")
+            if topic:
+                qa_text = f"Topic: {topic}\n{qa_text}"
+
+            documents.append({
+                "id": qa_id,
+                "text": qa_text,
+                "metadata": qa_meta,
+                "distance": qa_dist,
+            })
+            break  # take first QA that passes the threshold
 
     return documents
 
@@ -317,7 +342,7 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
             do_sample=True,
             temperature=0.5,
             top_p=0.85,
-            repetition_penalty=1.1,
+            repetition_penalty=1.15,
             pad_token_id=tokenizer.eos_token_id,
             stopping_criteria=StoppingCriteriaList([StopOnUserTurn()]),
         )
