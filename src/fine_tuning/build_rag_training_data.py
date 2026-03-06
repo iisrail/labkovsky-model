@@ -39,18 +39,17 @@ OUTPUT_FILE = FINE_TUNING_DIR / "qa_with_rag_context.jsonl"
 DT_LOOKUP_FILE = FINE_TUNING_DIR / "qa_rs_segmented.jsonl"
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-TOP_K = 2
-RETRIEVE_K = 5  # retrieve extra to have enough after filtering
-MAX_DISTANCE = 0.35  # skip docs further than this
-ADD_QA_DOC = True  # add closest non-self QA as extra doc
-QA_MAX_DISTANCE = 0.30  # stricter for QA to avoid noise
-MAX_DOCS_TOKENS = 1800  # token budget for docs only (~1.5 chars/token for Russian)
-MAX_DOCS_CHARS = int(MAX_DOCS_TOKENS * 1.5)  # ~2700 chars for docs portion
+TOP_K = 1              # 1 book/article doc (best by distance, no source preference)
+RETRIEVE_K = 5         # retrieve extra to have enough after filtering
+MAX_DISTANCE = 0.35    # skip docs further than this
+ADD_QA_DOC = True      # add closest non-self QA as extra doc
+QA_MAX_DISTANCE = 0.35 # same as book/article threshold
+MAX_DOCS_TOKENS = 2000 # token budget for docs only (~1.5 chars/token for Russian)
+MAX_DOCS_CHARS = int(MAX_DOCS_TOKENS * 1.5)  # ~3000 chars for docs portion
 
 # decision_type → short topic label
 DT_TOPIC = {
     "SELF_ESTEEM_CORRECTIVE": "self-esteem",
-    "EXPLANATION": "explanation",
     "DEPENDENCY_BOUNDARIES": "boundaries",
     "ANXIETY_MANAGEMENT": "anxiety",
     "ADDICTION_PATTERN": "addiction",
@@ -58,7 +57,6 @@ DT_TOPIC = {
     "AFFECTIVE_ADDICTION": "affective addiction",
     "PARENTING_MODEL": "parenting",
     "FEAR_SCENARIO_COPING": "fear coping",
-    "PARENTING_LIMITS": "parenting limits",
 }
 
 # Must match query_rag.py inference format
@@ -95,8 +93,39 @@ def load_dt_lookup(path: Path) -> dict:
     return lookup
 
 
-def expand_with_siblings(collection, doc_id: str, doc_text: str, meta: dict) -> str:
-    """Expand doc with up to 2 next chunks within same chapter/article."""
+def _make_chunk_id(doc_id: str, num: int) -> str:
+    """Build chunk ID from base doc_id and chunk number."""
+    if "_chunk" in doc_id:
+        base = doc_id.rsplit("_chunk", 1)[0]
+        return f"{base}_chunk{num}"
+    else:
+        base = doc_id.rsplit("_", 1)[0] if "_" in doc_id else doc_id
+        return f"{base}_{num}"
+
+
+def _find_chapter_end(collection, doc_id: str, chunk_num: int, group_id: str) -> int:
+    """Scan forward to find the last chunk number in this chapter."""
+    last_num = chunk_num
+    for offset in range(1, 30):  # scan up to 30 chunks forward
+        nid = _make_chunk_id(doc_id, chunk_num + offset)
+        next_doc = collection.get(ids=[nid], include=["metadatas"])
+        if not next_doc["ids"]:
+            break
+        next_group = (next_doc["metadatas"][0].get("chapter_id")
+                      or next_doc["metadatas"][0].get("article_id"))
+        if next_group != group_id:
+            break
+        last_num = chunk_num + offset
+    return last_num
+
+
+def expand_with_siblings(collection, doc_id: str, doc_text: str, meta: dict, source_type: str = "") -> str:
+    """
+    Expand doc with sibling chunks from same chapter/article.
+    - Book: jump to pre-last + last chunk of chapter (has principle/solution)
+    - Articles: concatenate up to 2 next siblings
+    Truncation (prefer later chunks) happens in formatting stage.
+    """
     chunk_id = meta.get("chunk_id")
     if chunk_id is None:
         return doc_text
@@ -104,91 +133,137 @@ def expand_with_siblings(collection, doc_id: str, doc_text: str, meta: dict) -> 
     try:
         chunk_num = int(chunk_id)
         group_id = meta.get("chapter_id") or meta.get("article_id")
+        is_book = source_type == "book"
 
-        if "_chunk" in doc_id:
-            base = doc_id.rsplit("_chunk", 1)[0]
+        if is_book:
+            # Book: jump to pre-last + last chunk of chapter (principle/solution)
+            last_num = _find_chapter_end(collection, doc_id, chunk_num, group_id)
+
+            if last_num > chunk_num + 1:
+                # Chapter has later content — use pre-last + last
+                pre_last = last_num - 1
+                texts = []
+                for num in [pre_last, last_num]:
+                    nid = _make_chunk_id(doc_id, num)
+                    chunk_doc = collection.get(ids=[nid], include=["documents"])
+                    if chunk_doc["ids"]:
+                        texts.append(chunk_doc["documents"][0])
+                if texts:
+                    doc_text = "\n".join(texts)
+            elif last_num == chunk_num + 1:
+                # Only one chunk after — use it
+                nid = _make_chunk_id(doc_id, last_num)
+                chunk_doc = collection.get(ids=[nid], include=["documents"])
+                if chunk_doc["ids"]:
+                    doc_text = doc_text + "\n" + chunk_doc["documents"][0]
+            # else: matched chunk IS the last — keep as is
         else:
-            base = doc_id.rsplit("_", 1)[0] if "_" in doc_id else doc_id
+            # Articles: concatenate up to 2 next siblings
+            for offset in range(1, 3):
+                nid = _make_chunk_id(doc_id, chunk_num + offset)
+                next_doc = collection.get(ids=[nid], include=["documents", "metadatas"])
+                if not next_doc["ids"]:
+                    break
+                next_group = (next_doc["metadatas"][0].get("chapter_id")
+                              or next_doc["metadatas"][0].get("article_id"))
+                if next_group != group_id:
+                    break
+                doc_text = doc_text + "\n" + next_doc["documents"][0]
 
-        for offset in range(1, 3):
-            if "_chunk" in doc_id:
-                nid = f"{base}_chunk{chunk_num + offset}"
-            else:
-                nid = f"{base}_{chunk_num + offset}"
-            next_doc = collection.get(ids=[nid], include=["documents", "metadatas"])
-            if not next_doc["ids"]:
-                break
-            next_group = (next_doc["metadatas"][0].get("chapter_id")
-                          or next_doc["metadatas"][0].get("article_id"))
-            if next_group != group_id:
-                break
-            doc_text = doc_text + "\n" + next_doc["documents"][0]
     except (ValueError, Exception):
         pass
 
     return doc_text
 
 
-def retrieve_book_article_docs(collection, query_embedding, rec_dt: str, top_k: int = TOP_K) -> list:
+EXPANSION_RANGE = 2  # how many siblings expansion can touch
+
+
+def _chunk_key(meta: dict) -> tuple:
+    """Return (group_id, chunk_num) for proximity checks, or None if not a chunk."""
+    group = meta.get("article_id") or meta.get("chapter_id") or ""
+    chunk_id = meta.get("chunk_id")
+    if not group or chunk_id is None:
+        return None
+    try:
+        return (group, int(chunk_id))
+    except (ValueError, TypeError):
+        return None
+
+
+def _overlaps_existing(meta: dict, seen_chunks: list) -> bool:
+    """Check if this chunk overlaps with any already-selected chunk after expansion.
+    Two chunks from the same group overlap if they're within EXPANSION_RANGE of each other."""
+    key = _chunk_key(meta)
+    if key is None:
+        return False
+    group, chunk_num = key
+    for s_group, s_num in seen_chunks:
+        if s_group == group and abs(chunk_num - s_num) <= EXPANSION_RANGE:
+            return True
+    return False
+
+
+def _query_and_collect(collection, query_embedding, where_filter, docs, seen_ids, seen_chunks, top_k, expand=True) -> list:
+    """Helper: query ChromaDB, expand chunks, collect into docs list.
+    Skips chunks that would overlap after expansion (within EXPANSION_RANGE of already-selected)."""
+    results = collection.query(
+        query_embeddings=[query_embedding.tolist()],
+        n_results=RETRIEVE_K,
+        where=where_filter,
+        include=["documents", "metadatas", "distances"]
+    )
+    for doc_id, doc_text, meta, dist in zip(
+        results['ids'][0], results['documents'][0],
+        results['metadatas'][0], results['distances'][0]
+    ):
+        if doc_id in seen_ids:
+            continue
+        if dist > MAX_DISTANCE:
+            continue
+        if _overlaps_existing(meta, seen_chunks):
+            continue
+        if expand:
+            source_type = meta.get("source_type", "")
+            doc_text = expand_with_siblings(collection, doc_id, doc_text, meta, source_type)
+        seen_ids.add(doc_id)
+        key = _chunk_key(meta)
+        if key:
+            seen_chunks.append(key)
+        docs.append({
+            "id": doc_id, "text": doc_text,
+            "distance": dist, "type": "book_article",
+        })
+        if len(docs) >= top_k:
+            break
+    return docs
+
+
+def retrieve_book_article_doc(collection, query_embedding, rec_dt: str) -> list:
     """
-    Retrieve book/article docs, preferring same decision_type.
-    1. Try with decision_type filter first
-    2. Fill remaining slots with cosine-only fallback
+    Retrieve 1 best book/article doc (no source preference, best by distance).
+    DT filter first, cosine fallback for records without dt.
     """
     docs = []
+    seen_ids = set()
+    seen_chunks = []
 
-    # Pass 1: same decision_type
     if rec_dt:
+        # Same dt, both sources together — best by distance wins
         try:
-            results = collection.query(
-                query_embeddings=[query_embedding.tolist()],
-                n_results=RETRIEVE_K,
-                where={"$and": [
+            _query_and_collect(collection, query_embedding,
+                {"$and": [
                     {"source_type": {"$in": ["articles", "book"]}},
                     {"decision_type": {"$eq": rec_dt}},
                 ]},
-                include=["documents", "metadatas", "distances"]
-            )
-            for doc_id, doc_text, meta, dist in zip(
-                results['ids'][0], results['documents'][0],
-                results['metadatas'][0], results['distances'][0]
-            ):
-                if dist > MAX_DISTANCE:
-                    continue
-                doc_text = expand_with_siblings(collection, doc_id, doc_text, meta)
-                docs.append({
-                    "id": doc_id, "text": doc_text,
-                    "distance": dist, "type": "book_article",
-                })
-                if len(docs) >= top_k:
-                    break
+                docs, seen_ids, seen_chunks, top_k=1)
         except Exception:
-            pass  # fall through to cosine-only
-
-    # Pass 2: cosine-only fallback for remaining slots
-    if len(docs) < top_k:
-        seen_ids = {d["id"] for d in docs}
-        results = collection.query(
-            query_embeddings=[query_embedding.tolist()],
-            n_results=RETRIEVE_K,
-            where={"source_type": {"$in": ["articles", "book"]}},
-            include=["documents", "metadatas", "distances"]
-        )
-        for doc_id, doc_text, meta, dist in zip(
-            results['ids'][0], results['documents'][0],
-            results['metadatas'][0], results['distances'][0]
-        ):
-            if doc_id in seen_ids:
-                continue
-            if dist > MAX_DISTANCE:
-                continue
-            doc_text = expand_with_siblings(collection, doc_id, doc_text, meta)
-            docs.append({
-                "id": doc_id, "text": doc_text,
-                "distance": dist, "type": "book_article",
-            })
-            if len(docs) >= top_k:
-                break
+            pass
+    else:
+        # No dt available (e.g. anti_generic records) — cosine fallback
+        _query_and_collect(collection, query_embedding,
+            {"source_type": {"$in": ["articles", "book"]}},
+            docs, seen_ids, seen_chunks, top_k=1)
 
     return docs
 
@@ -196,9 +271,11 @@ def retrieve_book_article_docs(collection, query_embedding, rec_dt: str, top_k: 
 def retrieve_qa_doc(collection, query_embedding, rec_id: str, rec_dt: str) -> list:
     """
     Retrieve closest non-self QA doc, preferring same decision_type.
-    Adds topic hint from decision_type metadata.
+    Topic hint uses the record's dt (describes what the question is about).
     """
     rec_qa_id = rec_id.rsplit("_", 1)[0] if "_" in rec_id else rec_id
+    # Topic hint from record's dt, not the retrieved QA's dt
+    topic = DT_TOPIC.get(rec_dt, "")
 
     def _find_non_self_qa(results) -> dict | None:
         for qa_id, qa_text, qa_meta, qa_dist in zip(
@@ -210,9 +287,6 @@ def retrieve_qa_doc(collection, query_embedding, rec_id: str, rec_dt: str) -> li
                 continue
             if qa_dist > QA_MAX_DISTANCE:
                 return None
-            # Add topic hint from decision_type
-            qa_dt = qa_meta.get("decision_type", "")
-            topic = DT_TOPIC.get(qa_dt, "")
             if topic:
                 qa_text = f"Topic: {topic}\n{qa_text}"
             return {
@@ -221,34 +295,25 @@ def retrieve_qa_doc(collection, query_embedding, rec_id: str, rec_dt: str) -> li
             }
         return None
 
-    # Pass 1: same decision_type
-    if rec_dt:
-        try:
-            results = collection.query(
-                query_embeddings=[query_embedding.tolist()],
-                n_results=5,
-                where={"$and": [
-                    {"source_type": {"$eq": "qa_corpus"}},
-                    {"decision_type": {"$eq": rec_dt}},
-                ]},
-                include=["documents", "metadatas", "distances"]
-            )
-            doc = _find_non_self_qa(results)
-            if doc:
-                return [doc]
-        except Exception:
-            pass
+    # Only retrieve QA with same decision_type — no dt mismatch allowed
+    if not rec_dt:
+        return []
 
-    # Pass 2: cosine-only fallback
-    results = collection.query(
-        query_embeddings=[query_embedding.tolist()],
-        n_results=5,
-        where={"source_type": {"$eq": "qa_corpus"}},
-        include=["documents", "metadatas", "distances"]
-    )
-    doc = _find_non_self_qa(results)
-    if doc:
-        return [doc]
+    try:
+        results = collection.query(
+            query_embeddings=[query_embedding.tolist()],
+            n_results=5,
+            where={"$and": [
+                {"source_type": {"$eq": "qa_corpus"}},
+                {"decision_type": {"$eq": rec_dt}},
+            ]},
+            include=["documents", "metadatas", "distances"]
+        )
+        doc = _find_non_self_qa(results)
+        if doc:
+            return [doc]
+    except Exception:
+        pass
 
     return []
 
@@ -292,10 +357,10 @@ def main():
         rec_dt = dt_lookup.get(rec_id, "")
         query_embedding = embed_model.encode(f"query: {question}")
 
-        # Retrieve book/article docs (prefer same decision_type)
-        docs = retrieve_book_article_docs(collection, query_embedding, rec_dt)
+        # Retrieve 1 book/article doc (best by distance, no source preference)
+        docs = retrieve_book_article_doc(collection, query_embedding, rec_dt)
 
-        # Retrieve QA doc (prefer same decision_type, topic hint instead of question)
+        # Retrieve 1 QA doc (same decision_type, topic hint)
         if ADD_QA_DOC:
             qa_docs = retrieve_qa_doc(collection, query_embedding, rec_id, rec_dt)
             docs.extend(qa_docs)
@@ -307,20 +372,38 @@ def main():
         if rec_dt and any(d.get("type") == "book_article" for d in docs):
             dt_match_count += 1
 
-        # Truncate docs to fit within token budget
+        # Format docs with budget: 1 book/article (Doc 1) + 1 QA (Doc 2)
+        # Reserve space for QA doc first
+        book_docs = [d for d in docs if d["type"] == "book_article"]
+        qa_docs_list = [d for d in docs if d["type"] == "qa"]
+
+        qa_parts = []
+        qa_chars = 0
+        for d in qa_docs_list:
+            part = f"[QA Example] Doc 2: {d['text']}"
+            qa_chars += len(part)
+            qa_parts.append(part)
+
+        # Book/article doc gets remaining budget
+        # When too long, truncate from BEGINNING (keep later chunks with principles)
+        book_budget = MAX_DOCS_CHARS - qa_chars
         doc_parts = []
-        total_chars = 0
-        for j, d in enumerate(docs):
-            label = "[Book/Article]" if d["type"] == "book_article" else "[QA Example]"
-            part = f"{label} Doc {j+1}: {d['text']}"
-            if total_chars + len(part) > MAX_DOCS_CHARS:
-                remaining = MAX_DOCS_CHARS - total_chars
-                if remaining > 200:  # only add if meaningful amount left
-                    part = part[:remaining] + "..."
-                    doc_parts.append(part)
-                break
-            doc_parts.append(part)
-            total_chars += len(part)
+        for d in book_docs:
+            label = "[Book/Article] Doc 1: "
+            text = d['text']
+            available = book_budget - len(label)
+            if len(text) > available:
+                cut = text[-(available - 3):]
+                # Snap to next word boundary (don't cut mid-word)
+                space = cut.find(" ")
+                if space > 0 and space < 50:
+                    cut = cut[space + 1:]
+                text = "..." + cut
+            doc_parts.append(label + text)
+
+        # Append QA doc
+        doc_parts.extend(qa_parts)
+
         docs_text = "\n\n".join(doc_parts)
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(docs=docs_text)
 

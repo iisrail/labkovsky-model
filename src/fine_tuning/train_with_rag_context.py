@@ -129,26 +129,25 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
 FINE_TUNING_DIR = PROJECT_ROOT / "data" / "fine_tuning"
-OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-rag-context-lora-v7"
+OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-rag-context-lora-v10"
 
 # Built by build_rag_training_data.py — each record has question, answer, system_prompt
 INPUT_FILE = FINE_TUNING_DIR / "qa_with_rag_context.jsonl"
 
 # Base model: Vikhr + book LoRA merged (Stage 1 already baked in)
 MODEL_NAME = "./models/vikhr-book-merged"
-MAX_SEQ_LENGTH = 3200  # fits system prompt (~1800 tok docs) + question + answer
+MAX_SEQ_LENGTH = 3200  # fits system prompt (~2000 tok docs) + question + answer
 
-# LoRA config — small rank to preserve RAG grounding from base model
-# Only attention + gate_proj: MLP (up_proj, down_proj) stays frozen (trained in Stage 1)
-LORA_R = 8          # low rank — enough for style, won't override RAG grounding
-LORA_ALPHA = 24      # 3x ratio — standard for style adaptation
+# LoRA config — attention only (MLP already trained in book LoRA)
+LORA_R = 8
+LORA_ALPHA = 24
 LORA_DROPOUT = 0.0
-TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]
+TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # Training hyperparameters
 BATCH_SIZE = 1                  # limited by VRAM with long sequences
 GRADIENT_ACCUMULATION = 16      # effective batch = 16
-LEARNING_RATE = 3e-5            # lower than v5 (5e-5) for more gradual convergence
+LEARNING_RATE = 2e-5            # balanced LR with alpha=24
 NUM_EPOCHS = 20                 # early stopping will cut this short (patience=2)
 WARMUP_RATIO = 0.05             # ~1 epoch warmup
 VAL_RATIO = 0.15                # 15% held out for eval
