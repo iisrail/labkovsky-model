@@ -147,7 +147,7 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
 
 TOP_K = 2
 EXPAND_CHUNKS = True  # concatenate next chunks from same chapter/article
-QA_MIN_DISTANCE = 0.25  # skip QA docs closer than this — too close means near-exact match, model copies details
+QA_MIN_DISTANCE = 0.0  # skip QA docs closer than this — too close means near-exact match, model copies details
 
 # decision_type → short topic label (must match build_rag_training_data.py)
 DT_TOPIC = {
