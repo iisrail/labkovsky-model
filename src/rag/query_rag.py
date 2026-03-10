@@ -36,7 +36,6 @@ MODELS_DIR = PROJECT_DIR / "models"
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 LLM_MODEL_NAME = "./models/vikhr-book-merged"
 LORA_PATH = MODELS_DIR / "labkovsky-rag-context-lora"
-SFT_LORA_PATH = MODELS_DIR / "labkovsky-rag-context-lora-v10" / "checkpoint-130"
 EVAL_LOG_PATH = PROJECT_DIR / "data" / "eval_log.jsonl"
 
 # System prompt template - docs will be inserted
@@ -106,14 +105,13 @@ def _resolve_best_checkpoint(lora_path: Path) -> Path:
     return lora_path
 
 
-def init_llm(use_lora: bool = True, lora_path: Path = None, sft_lora_path: Path = None, base_model_name: str = None):
+def init_llm(use_lora: bool = True, lora_path: Path = None):
     global _llm, _tokenizer
     if _llm is None:
-        model_name = base_model_name or LLM_MODEL_NAME
-        print(f"[+] Loading LLM: {model_name}")
+        print(f"[+] Loading LLM: {LLM_MODEL_NAME}")
 
         # Always load tokenizer from base model (Unsloth LoRA doesn't add tokens)
-        _tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME, trust_remote_code=True)
         _tokenizer.pad_token = _tokenizer.eos_token
 
         bnb_config = BitsAndBytesConfig(
@@ -124,20 +122,11 @@ def init_llm(use_lora: bool = True, lora_path: Path = None, sft_lora_path: Path 
         )
 
         base_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
+            LLM_MODEL_NAME,
             quantization_config=bnb_config,
             device_map="auto",
             trust_remote_code=True,
         )
-
-        # If sft_lora_path provided, load SFT LoRA first and merge into base
-        # (needed when loading DPO LoRA which was trained on top of SFT)
-        if sft_lora_path and sft_lora_path.exists():
-            sft_lora_path = _resolve_best_checkpoint(sft_lora_path)
-            print(f"   Loading SFT LoRA: {sft_lora_path}")
-            base_model = PeftModel.from_pretrained(base_model, str(sft_lora_path))
-            base_model = base_model.merge_and_unload()
-            print("   SFT LoRA merged into base")
 
         if use_lora and lora_path and lora_path.exists():
             lora_path = _resolve_best_checkpoint(lora_path)
@@ -158,7 +147,7 @@ def init_llm(use_lora: bool = True, lora_path: Path = None, sft_lora_path: Path 
 
 TOP_K = 2
 EXPAND_CHUNKS = True  # concatenate next chunks from same chapter/article
-QA_MIN_DISTANCE = 0.0  # no filtering — include closest QA
+QA_MIN_DISTANCE = 0.25  # skip QA docs closer than this — too close means near-exact match, model copies details
 
 # decision_type → short topic label (must match build_rag_training_data.py)
 DT_TOPIC = {
@@ -420,10 +409,7 @@ def log_eval(model_path: str, query: str, answer: str, docs: list, notes: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--chroma-dir", type=str, default=str(CHROMA_DIR), help="ChromaDB directory")
-    parser.add_argument("--base-model", type=str, default=LLM_MODEL_NAME, help="Base model path")
     parser.add_argument("--lora-path", type=str, default=str(LORA_PATH), help="LoRA adapter path")
-    parser.add_argument("--sft-lora-path", type=str, default=None,
-                        help="SFT LoRA to merge before loading main LoRA (for DPO stacking)")
     parser.add_argument("--no-lora", action="store_true", help="Use base model without LoRA")
     parser.add_argument("--verbose", action="store_true", help="Show retrieved RAG documents")
     parser.add_argument("--no-log", action="store_true", help="Disable eval logging")
@@ -445,9 +431,8 @@ def main():
     init_retrieval(Path(args.chroma_dir))
 
     lora_path = None if args.no_lora else Path(args.lora_path)
-    sft_lora_path = Path(args.sft_lora_path) if args.sft_lora_path else None
     resolved_lora = _resolve_best_checkpoint(lora_path) if lora_path else None
-    init_llm(use_lora=not args.no_lora, lora_path=lora_path, sft_lora_path=sft_lora_path, base_model_name=args.base_model)
+    init_llm(use_lora=not args.no_lora, lora_path=lora_path)
 
     if args.no_lora:
         model_label = "base-no-lora"
