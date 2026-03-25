@@ -206,9 +206,57 @@ SYSTEM_PROMPT_TEMPLATE = (
 - Connected chunks for direct training (articles, book)
 - RS markers in training data targets (model hallucinates wrong markers)
 - QA answers in training retrieval (model copies verbatim)
-- Vikhr native `documents` role for advice (works for factual, not advice style)
+- Vikhr native `documents` role with two-step prompt (see below)
 - Interviews in RAG index (not useful)
 - No-docs fallback prompt in training (mismatch with inference)
+
+## Why Vikhr's Native `documents` Role Didn't Work
+
+Vikhr-YandexGPT has a special `documents` role for grounded RAG generation. We tested whether it could handle psychological advice (reasoning from principles) vs just factual extraction.
+
+### Test Setup (`scripts/test_vikhr_grounded_rag.py`)
+
+| Test | Documents | Query | Prompt |
+|------|-----------|-------|--------|
+| 1 | Factual (climate data) | Topic ("Глобальное потепление") | Vikhr two-step |
+| 2 | Psychological principles | Personal question ("Почему я не могу уйти от мужа?") | Vikhr two-step |
+| 3 | Psychological principles | Topic ("Отношения и любовь к себе") | Vikhr two-step |
+| 4 | Psychological principles | Personal question | Labkovsky-style single-step |
+
+### Results
+
+| Test | Step 1 (doc selection) | Step 2 (answer) | Verdict |
+|------|------------------------|-----------------|---------|
+| 1 | `[0, 1]` ✓ | Good factual synthesis | WORKS |
+| 2 | `[]` empty ✗ | "Can't find info" | FAILS |
+| 3 | `[0, 1, 2]` ✓ | Good synthesis | WORKS |
+| 4 | N/A (single-step) | Good reasoning from principles | WORKS |
+
+### Key Finding: Two-Step Prompt Fails on Step 1
+
+Vikhr's documented two-step approach:
+```
+System: "Give two answers: first list relevant doc IDs, then answer using those docs"
+```
+
+**Step 1 is designed for factual retrieval, not principle matching:**
+- Query: "Почему я не могу уйти от мужа?" (Why can't I leave my husband?)
+- Doc 1: "Почему люди остаются в плохих отношениях" (Why people stay in bad relationships)
+- Model returns: `{"relevant_doc_ids": []}` — **EMPTY**
+
+The model looks for **direct factual match** (does doc answer this exact question?), not **principle match** (does doc contain principles that APPLY to this question?).
+
+**Test 4 proves the `documents` role itself works** — with a single-step Labkovsky prompt ("apply these principles to user's situation"), the model successfully reasons from the documents.
+
+### Conclusion
+
+| Approach | Reasoning from Principles | Labkovsky Style |
+|----------|--------------------------|-----------------|
+| Vikhr two-step + `documents` role | ✗ Fails at doc selection | ✗ Generic |
+| Single-step + `documents` role | ✓ Works | ✗ Generic |
+| System prompt + LoRA training | ✓ Works | ✓ Authentic |
+
+**The problem is not the `documents` role — it's the two-step extractive prompt.** However, even with a working single-step approach, LoRA training is still needed to capture Labkovsky's distinctive voice (blunt, direct, tough love).
 
 ## Project Structure
 ```
@@ -250,6 +298,34 @@ python src/fine_tuning/train_with_rag_context.py
 # Query
 python src/rag/query_rag.py --lora-path models/labkovsky-rag-context-lora-v5
 python src/rag/query_rag.py --no-lora  # baseline
+```
+
+## Development Environment
+
+### Why WSL is Required for Training
+
+Unsloth requires **Triton** for optimized GPU kernels. Triton only supports Linux.
+
+**Windows limitations:**
+- Triton cannot be installed natively on Windows
+- Windows torch stuck at 2.6.0+cu124 — Unsloth requires newer torch
+- Result: `ModuleNotFoundError: No module named 'triton'`
+
+**Solution:** WSL Ubuntu supports torch 2.10.0 + triton 3.6.0 — works with Unsloth.
+
+**Two venvs in project:**
+| Venv | Platform | Unsloth | Use Case |
+|------|----------|---------|----------|
+| `venv/` | Windows | ❌ No triton | Inference only (with transformers) |
+| `venv_wsl/` | WSL Ubuntu | ✅ Works | Training with Unsloth |
+
+```bash
+# Training (WSL required)
+source venv_wsl/bin/activate
+python src/fine_tuning/train_with_rag_context.py
+
+# Inference (works on both)
+python src/rag/query_rag.py
 ```
 
 ## Code Conventions
