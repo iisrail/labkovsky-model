@@ -45,7 +45,11 @@ SYSTEM_PROMPT_TEMPLATE = (
     "for your reasoning, but do not copy verbatim.\n"
     "QA examples show how to structure a response — use them as a guide for tone and format.\n\n"
     "{docs}\n\n"
-    "Answer in Labkovsky's style: direct, confident, with specific recommendations. "
+    "CRITICAL RULES:\n"
+    "1. Pay close attention to the specific details the user mentions.\n"
+    "2. If the user says they already did something, acknowledge it — don't suggest they do it.\n"
+    "3. Synthesize principles into YOUR OWN response — never copy text directly.\n\n"
+    "Answer in Labkovsky's style: blunt, confident, with tough love if needed. "
     "First explain the root cause, then give concrete steps. "
     "If professional help is needed — say so directly."
 )
@@ -105,28 +109,39 @@ def _resolve_best_checkpoint(lora_path: Path) -> Path:
     return lora_path
 
 
-def init_llm(use_lora: bool = True, lora_path: Path = None):
+def init_llm(use_lora: bool = True, lora_path: Path = None, base_model_path: str = None, skip_quantization: bool = False):
     global _llm, _tokenizer
+    model_path = base_model_path or LLM_MODEL_NAME
     if _llm is None:
-        print(f"[+] Loading LLM: {LLM_MODEL_NAME}")
+        print(f"[+] Loading LLM: {model_path}")
 
         # Always load tokenizer from base model (Unsloth LoRA doesn't add tokens)
-        _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_NAME, trust_remote_code=True)
+        _tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         _tokenizer.pad_token = _tokenizer.eos_token
 
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
+        if skip_quantization:
+            # Load pre-quantized model (AWQ/GPTQ) without additional quantization
+            print("   (loading pre-quantized model)")
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+        else:
+            # Apply BitsAndBytes 4-bit quantization on-the-fly
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
 
-        base_model = AutoModelForCausalLM.from_pretrained(
-            LLM_MODEL_NAME,
-            quantization_config=bnb_config,
-            device_map="auto",
-            trust_remote_code=True,
-        )
+            base_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                quantization_config=bnb_config,
+                device_map="auto",
+                trust_remote_code=True,
+            )
 
         if use_lora and lora_path and lora_path.exists():
             lora_path = _resolve_best_checkpoint(lora_path)
@@ -145,9 +160,10 @@ def init_llm(use_lora: bool = True, lora_path: Path = None):
 # RETRIEVAL
 # ============================================================
 
-TOP_K = 2
+TOP_K = 2  # Increased: more book/article principles for synthesis
 EXPAND_CHUNKS = True  # concatenate next chunks from same chapter/article
 QA_MIN_DISTANCE = 0.0  # skip QA docs closer than this — too close means near-exact match, model copies details
+INCLUDE_QA_DOCS = True  # QA docs enabled for style/format guidance
 
 # decision_type → short topic label (must match build_rag_training_data.py)
 DT_TOPIC = {
@@ -164,10 +180,37 @@ DT_TOPIC = {
 }
 
 
+def _make_chunk_id(doc_id: str, num: int) -> str:
+    """Build chunk ID from base doc_id and chunk number."""
+    if "_chunk" in doc_id:
+        base = doc_id.rsplit("_chunk", 1)[0]
+        return f"{base}_chunk{num}"
+    else:
+        base = doc_id.rsplit("_", 1)[0] if "_" in doc_id else doc_id
+        return f"{base}_{num}"
+
+
+def _find_chapter_end(collection, doc_id: str, chunk_num: int, group_id: str) -> int:
+    """Scan forward to find the last chunk number in this chapter."""
+    last_num = chunk_num
+    for offset in range(1, 30):
+        nid = _make_chunk_id(doc_id, chunk_num + offset)
+        next_doc = collection.get(ids=[nid], include=["metadatas"])
+        if not next_doc["ids"]:
+            break
+        next_group = (next_doc["metadatas"][0].get("chapter_id")
+                      or next_doc["metadatas"][0].get("article_id"))
+        if next_group != group_id:
+            break
+        last_num = chunk_num + offset
+    return last_num
+
+
 def _expand_with_next_chunks(collection, doc_id: str, doc_text: str, metadata: dict, max_extra: int = 2) -> str:
     """
-    Concatenate up to max_extra next chunks within same chapter/article.
-    Matches build_rag_training_data.py format exactly.
+    Expand chunk depending on source type. Matches build_rag_training_data.py.
+    - Book: jump to last chunk of chapter (has principle/conclusion)
+    - Articles: concatenate up to max_extra next siblings
     """
     chunk_id = metadata.get("chunk_id")
     if chunk_id is None:
@@ -179,24 +222,31 @@ def _expand_with_next_chunks(collection, doc_id: str, doc_text: str, metadata: d
         return doc_text
 
     group_id = metadata.get("chapter_id") or metadata.get("article_id")
-    base_id = doc_id.rsplit("_chunk", 1)[0] if "_chunk" in doc_id else None
+    source_type = metadata.get("source_type", "")
 
-    if not base_id:
-        return doc_text
-
-    for offset in range(1, max_extra + 1):
-        next_id = f"{base_id}_chunk{chunk_num + offset}"
-        try:
-            next_doc = collection.get(ids=[next_id], include=["documents", "metadatas"])
-            if not next_doc["ids"]:
+    if source_type == "book":
+        # Book: jump to last chunk of chapter (has principle/conclusion)
+        last_num = _find_chapter_end(collection, doc_id, chunk_num, group_id)
+        if last_num > chunk_num:
+            nid = _make_chunk_id(doc_id, last_num)
+            chunk_doc = collection.get(ids=[nid], include=["documents"])
+            if chunk_doc["ids"]:
+                doc_text = chunk_doc["documents"][0]
+    else:
+        # Articles: concatenate up to max_extra next siblings
+        for offset in range(1, max_extra + 1):
+            nid = _make_chunk_id(doc_id, chunk_num + offset)
+            try:
+                next_doc = collection.get(ids=[nid], include=["documents", "metadatas"])
+                if not next_doc["ids"]:
+                    break
+                next_group = (next_doc["metadatas"][0].get("chapter_id")
+                              or next_doc["metadatas"][0].get("article_id"))
+                if next_group != group_id:
+                    break
+                doc_text = doc_text + "\n" + next_doc["documents"][0]
+            except Exception:
                 break
-            next_group = (next_doc["metadatas"][0].get("chapter_id")
-                          or next_doc["metadatas"][0].get("article_id"))
-            if next_group != group_id:
-                break
-            doc_text = doc_text + "\n" + next_doc["documents"][0]
-        except Exception:
-            break
 
     return doc_text
 
@@ -243,35 +293,37 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K, expa
             })
 
     # Step 2: Add one QA doc (skip too-close matches, take next-best)
-    qa_results = collection.query(
-        query_embeddings=[query_embedding.tolist()],
-        n_results=5,
-        where={"source_type": {"$eq": "qa_corpus"}},
-        include=["documents", "metadatas", "distances"]
-    )
+    # NOTE: QA docs disabled by default - causes verbatim copying in 8B model
+    if INCLUDE_QA_DOCS:
+        qa_results = collection.query(
+            query_embeddings=[query_embedding.tolist()],
+            n_results=5,
+            where={"source_type": {"$eq": "qa_corpus"}},
+            include=["documents", "metadatas", "distances"]
+        )
 
-    if qa_results['ids'][0]:
-        for qa_id, qa_text, qa_meta, qa_dist in zip(
-            qa_results['ids'][0], qa_results['documents'][0],
-            qa_results['metadatas'][0], qa_results['distances'][0]
-        ):
-            if qa_dist < QA_MIN_DISTANCE:
-                print(f"   [QA skip] {qa_id} dist={qa_dist:.3f} < {QA_MIN_DISTANCE} (too close)")
-                continue
+        if qa_results['ids'][0]:
+            for qa_id, qa_text, qa_meta, qa_dist in zip(
+                qa_results['ids'][0], qa_results['documents'][0],
+                qa_results['metadatas'][0], qa_results['distances'][0]
+            ):
+                if qa_dist < QA_MIN_DISTANCE:
+                    print(f"   [QA skip] {qa_id} dist={qa_dist:.3f} < {QA_MIN_DISTANCE} (too close)")
+                    continue
 
-            # Add topic hint from decision_type (matches training format)
-            qa_dt = qa_meta.get("decision_type", "")
-            topic = DT_TOPIC.get(qa_dt, "")
-            if topic:
-                qa_text = f"Topic: {topic}\n{qa_text}"
+                # Add topic hint from decision_type (matches training format)
+                qa_dt = qa_meta.get("decision_type", "")
+                topic = DT_TOPIC.get(qa_dt, "")
+                if topic:
+                    qa_text = f"Topic: {topic}\n{qa_text}"
 
-            documents.append({
-                "id": qa_id,
-                "text": qa_text,
-                "metadata": qa_meta,
-                "distance": qa_dist,
-            })
-            break  # take first QA that passes the threshold
+                documents.append({
+                    "id": qa_id,
+                    "text": qa_text,
+                    "metadata": qa_meta,
+                    "distance": qa_dist,
+                })
+                break  # take first QA that passes the threshold
 
     return documents
 
@@ -281,7 +333,16 @@ def retrieve(query: str, chroma_dir: Path = CHROMA_DIR, top_k: int = TOP_K, expa
 
 
 
-def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: Path = LORA_PATH) -> str:
+def generate(
+    query: str,
+    context_docs: list,
+    use_lora: bool = True,
+    lora_path: Path = LORA_PATH,
+    temperature: float = 0.5,
+    repetition_penalty: float = 1.15,
+    top_p: float = 0.85,
+    max_tokens: int = 400,
+) -> str:
     """
     Generate response with docs in system prompt (not documents role).
 
@@ -290,6 +351,10 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
         context_docs: List of dicts with 'text' and 'metadata' keys
         use_lora: Whether to use LoRA adapter
         lora_path: Path to LoRA adapter
+        temperature: Sampling temperature (higher = more varied)
+        repetition_penalty: Penalty for repeated tokens (higher = less repetition)
+        top_p: Nucleus sampling threshold
+        max_tokens: Maximum tokens to generate
 
     Returns:
         Generated response string
@@ -304,7 +369,7 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
         return "[Book/Article]"
 
     docs_text = "\n\n".join([
-        f"{_doc_label(doc)} Документ {i+1}: {doc['text']}"
+        f"{_doc_label(doc)} Doc {i+1}: {doc['text']}"
         for i, doc in enumerate(context_docs)
     ])
 
@@ -338,11 +403,11 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
     with torch.inference_mode():
         outputs = llm.generate(
             **inputs,
-            max_new_tokens=512,
+            max_new_tokens=max_tokens,
             do_sample=True,
-            temperature=0.5,
-            top_p=0.85,
-            repetition_penalty=1.15,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
             pad_token_id=tokenizer.eos_token_id,
             stopping_criteria=StoppingCriteriaList([StopOnUserTurn()]),
         )
@@ -356,7 +421,13 @@ def generate(query: str, context_docs: list, use_lora: bool = True, lora_path: P
 # MAIN FUNCTION
 # ============================================================
 
-def ask_labkovsky(query: str) -> dict:
+def ask_labkovsky(
+    query: str,
+    temperature: float = 0.5,
+    repetition_penalty: float = 1.15,
+    top_p: float = 0.85,
+    max_tokens: int = 400,
+) -> dict:
     """Query the RAG pipeline and generate a response."""
     # Step 1: Retrieve top-k relevant documents
     docs = retrieve(query)
@@ -376,7 +447,14 @@ def ask_labkovsky(query: str) -> dict:
     docs_for_generation = docs
 
     # Step 3: Generate response grounded on documents
-    answer = generate(query, docs_for_generation)
+    answer = generate(
+        query,
+        docs_for_generation,
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        top_p=top_p,
+        max_tokens=max_tokens,
+    )
 
     return {
         "answer": answer,
@@ -413,6 +491,11 @@ def main():
     parser.add_argument("--no-lora", action="store_true", help="Use base model without LoRA")
     parser.add_argument("--verbose", action="store_true", help="Show retrieved RAG documents")
     parser.add_argument("--no-log", action="store_true", help="Disable eval logging")
+    parser.add_argument("--temperature", type=float, default=0.5, help="Sampling temperature (default: 0.5)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.15, help="Repetition penalty (default: 1.15)")
+    parser.add_argument("--top-p", type=float, default=0.85, help="Nucleus sampling top-p (default: 0.85)")
+    parser.add_argument("--max-tokens", type=int, default=400, help="Max tokens to generate (default: 400)")
+    parser.add_argument("--base-model", type=str, default=None, help="Base model path (default: vikhr-book-merged)")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -421,6 +504,7 @@ def main():
     print("Type 'exit' to quit, 'verbose' to toggle RAG docs display")
     if not args.no_log:
         print("After each answer, enter notes (or press Enter to skip)")
+    print(f"Settings: temp={args.temperature}, rep_penalty={args.repetition_penalty}, top_p={args.top_p}, max_tokens={args.max_tokens}")
     print()
 
     verbose = args.verbose
@@ -432,9 +516,11 @@ def main():
 
     lora_path = None if args.no_lora else Path(args.lora_path)
     resolved_lora = _resolve_best_checkpoint(lora_path) if lora_path else None
-    init_llm(use_lora=not args.no_lora, lora_path=lora_path)
+    init_llm(use_lora=not args.no_lora, lora_path=lora_path, base_model_path=args.base_model)
 
-    if args.no_lora:
+    if args.base_model:
+        model_label = args.base_model
+    elif args.no_lora:
         model_label = "base-no-lora"
     else:
         try:
@@ -466,7 +552,13 @@ def main():
         print("\n...")
 
         try:
-            result = ask_labkovsky(query)
+            result = ask_labkovsky(
+                query,
+                temperature=args.temperature,
+                repetition_penalty=args.repetition_penalty,
+                top_p=args.top_p,
+                max_tokens=args.max_tokens,
+            )
 
             dist = result['best_distance']
             used = result['docs_used']
