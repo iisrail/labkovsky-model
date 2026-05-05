@@ -129,20 +129,23 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
 FINE_TUNING_DIR = PROJECT_ROOT / "data" / "fine_tuning"
-OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-rag-context-lora-v10"
+OUTPUT_DIR = PROJECT_ROOT / "models" / "labkovsky-rag-context-lora-v14-v4-no-mmr-all7-tags-r16"
 
 # Built by build_rag_training_data.py — each record has question, answer, system_prompt
-INPUT_FILE = FINE_TUNING_DIR / "qa_with_rag_context.jsonl"
+INPUT_FILE = FINE_TUNING_DIR / "qa_with_rag_context_v4_fixed.jsonl"
 
 # Base model: Vikhr + book LoRA merged (Stage 1 already baked in)
 MODEL_NAME = "./models/vikhr-book-merged"
 MAX_SEQ_LENGTH = 3200  # fits system prompt (~2000 tok docs) + question + answer
 
-# LoRA config — attention only (MLP already trained in book LoRA)
-LORA_R = 8
-LORA_ALPHA = 24
+# LoRA config — all modules for tagged RAG-answer adaptation on book-merged base
+LORA_R = 16
+LORA_ALPHA = 32
 LORA_DROPOUT = 0.0
-TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"]
+TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj",
+]
 
 # Training hyperparameters
 BATCH_SIZE = 1                  # limited by VRAM with long sequences

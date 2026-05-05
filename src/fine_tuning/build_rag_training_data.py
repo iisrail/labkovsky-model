@@ -21,6 +21,14 @@ from pathlib import Path
 from sentence_transformers import SentenceTransformer
 import chromadb
 
+def trim_at_section_break(text: str) -> str:
+    """Trim text at first section break (3+ consecutive newlines)."""
+    match = re.search(r'\n{3,}', text)
+    if match:
+        return text[:match.start()].strip()
+    return text
+
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -66,7 +74,7 @@ SYSTEM_PROMPT_TEMPLATE = (
     "for your reasoning, but do not copy verbatim.\n"
     "QA examples show how to structure a response — use them as a guide for tone and format.\n\n"
     "{docs}\n\n"
-    "Answer in Labkovsky's style: direct, confident, with specific recommendations. "
+    "Answer in Labkovsky's style: blunt, confident, with tough love if needed. "
     "First explain the root cause, then give concrete steps. "
     "If professional help is needed — say so directly."
 )
@@ -136,26 +144,15 @@ def expand_with_siblings(collection, doc_id: str, doc_text: str, meta: dict, sou
         is_book = source_type == "book"
 
         if is_book:
-            # Book: jump to pre-last + last chunk of chapter (principle/solution)
+            # Book: jump to last chunk of chapter (has principle/conclusion)
             last_num = _find_chapter_end(collection, doc_id, chunk_num, group_id)
 
-            if last_num > chunk_num + 1:
-                # Chapter has later content — use pre-last + last
-                pre_last = last_num - 1
-                texts = []
-                for num in [pre_last, last_num]:
-                    nid = _make_chunk_id(doc_id, num)
-                    chunk_doc = collection.get(ids=[nid], include=["documents"])
-                    if chunk_doc["ids"]:
-                        texts.append(chunk_doc["documents"][0])
-                if texts:
-                    doc_text = "\n".join(texts)
-            elif last_num == chunk_num + 1:
-                # Only one chunk after — use it
+            if last_num > chunk_num:
+                # Replace with last chunk of chapter
                 nid = _make_chunk_id(doc_id, last_num)
                 chunk_doc = collection.get(ids=[nid], include=["documents"])
                 if chunk_doc["ids"]:
-                    doc_text = doc_text + "\n" + chunk_doc["documents"][0]
+                    doc_text = chunk_doc["documents"][0]
             # else: matched chunk IS the last — keep as is
         else:
             # Articles: concatenate up to 2 next siblings
@@ -172,6 +169,9 @@ def expand_with_siblings(collection, doc_id: str, doc_text: str, meta: dict, sou
 
     except (ValueError, Exception):
         pass
+
+    # Trim at section breaks (3+ newlines)
+    doc_text = trim_at_section_break(doc_text)
 
     return doc_text
 

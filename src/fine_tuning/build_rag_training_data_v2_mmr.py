@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Build training data with reasoning cards as RAG context (v4 no-MMR debug).
+Build training data with reasoning cards as RAG context (v4 fixed).
 
 Uses condensed reasoning cards from card_principals_deduped_v2_092.jsonl.
 
 Selection order:
 1. Read card DT from dt / dt_primary / decision_type / dt_secondary.
-2. Build candidates from exact QA DT matches only.
-3. Score candidates by cosine similarity.
-4. Add a small bounded lexical boost for shared case-specific terms.
+2. Prefer exact QA DT matches.
+3. Add alias DT matches only if exact matches are insufficient.
+4. Use question + answer embedding and MMR diversity.
 5. Do not pull global fallback cards by default, because noisy context is worse than fewer cards.
 
 Usage:
-    python src/fine_tuning/build_rag_training_data_v4_no_mmr_debug.py
+    python src/fine_tuning/build_rag_training_data_v4_fixed.py
 """
 
 import json
-import os
-import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import numpy as np
@@ -35,7 +33,7 @@ FINE_TUNING_DIR = PROJECT_ROOT / "data" / "fine_tuning"
 
 # Input files
 INPUT_FILES = [
-    FINE_TUNING_DIR / "qa_rs_segmented.jsonl",
+    FINE_TUNING_DIR / "qa_clean.jsonl",
     FINE_TUNING_DIR / "anti_generic_finance.jsonl",
 ]
 CARDS_FILE = FINE_TUNING_DIR / "card_principals_deduped_v2_092.jsonl"
@@ -48,25 +46,16 @@ OUTPUT_FILE = FINE_TUNING_DIR / "qa_with_rag_context_v4_fixed.jsonl"
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
 MAX_CARDS = 3  # Keep context sharp: top 3 reasoning cards per QA
-LEXICAL_MATCH_BOOST = 0.012  # Per case-specific token shared by QA and card
-MAX_LEXICAL_BOOST = 0.06  # Keep lexical matching as a tie-breaker, not a hard rule
 
-STOP_TERMS = {
-    "без", "был", "была", "были", "быть", "вам", "вас", "ваш", "все",
-    "для", "его", "если", "еще", "или", "как", "мне", "мой", "над",
-    "нас", "нее", "нет", "они", "она", "оно", "при", "про", "сам",
-    "себ", "так", "там", "тем", "тех", "тог", "тут", "уже", "что",
-    "это", "этот", "your", "with", "that", "this", "from", "have",
-    "должен", "есть", "которы", "люди", "челове", "пробле",
+# Optional DT aliases for matching only.
+# Important: aliases are NOT written back as the QA decision_type.
+# Exact DT matches are always preferred over aliases.
+DT_ALIASES = {
+    "ADDICTION_PATTERN": ["AFFECTIVE_ADDICTION"],
 }
 
 # Global fallback often injects weak unrelated cards. Keep it off for training quality.
 ALLOW_GLOBAL_FALLBACK = False
-
-# Debug controls: override DEBUG_QA_ID / DEBUG_GOLD_TEXT env vars to inspect one case.
-DEBUG_QA_ID = os.getenv("DEBUG_QA_ID", "srJvn19GKNA_01")
-DEBUG_GOLD_TEXT = os.getenv("DEBUG_GOLD_TEXT", "В основе многих зависимостей лежит тревога")
-DEBUG_TOP_N = 15
 
 # System prompt template (no book/article or QA example references)
 SYSTEM_PROMPT_TEMPLATE = (
@@ -153,7 +142,7 @@ def get_record_dts(rec: Dict[str, Any], lookup_data: Optional[Dict[str, Any]] = 
 
 
 def get_original_decision_type(rec: Dict[str, Any], lookup_data: Optional[Dict[str, Any]] = None) -> str:
-    """Preserve the QA's original DT for output/debug."""
+    """Preserve the QA's original DT for output/debug. Do not output aliases."""
     for source in (rec, lookup_data or {}):
         for key in ("decision_type", "dt", "dt_primary"):
             value = source.get(key)
@@ -162,212 +151,108 @@ def get_original_decision_type(rec: Dict[str, Any], lookup_data: Optional[Dict[s
     return ""
 
 
+def expand_dt_aliases(dts: set) -> set:
+    """Return alias DTs for matching only."""
+    aliases = set()
+    for dt in dts:
+        for alias in DT_ALIASES.get(dt, []):
+            aliases.add(alias)
+    return aliases
+
+
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """Compute cosine similarity between two vectors."""
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
-def tokenize_for_overlap(text: str) -> set:
-    """Return coarse Russian/English term keys for lexical tie-breaking."""
-    terms = set()
-    for token in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text.lower().replace("ё", "е")):
-        if len(token) < 4 or token in STOP_TERMS:
-            continue
-        key = token[:6] if len(token) > 6 else token
-        if key not in STOP_TERMS:
-            terms.add(key)
-    return terms
-
-
-def lexical_overlap_boost(qa_terms: set, card_text: str) -> tuple:
-    """Score shared case-specific terms between QA text and a card principle."""
-    card_terms = tokenize_for_overlap(card_text)
-    overlap = qa_terms & card_terms
-    boost = min(MAX_LEXICAL_BOOST, LEXICAL_MATCH_BOOST * len(overlap))
-    return boost, sorted(overlap)
-
-
 def select_cards(
     qa_dts: set,
-    qa_text: str,
+    qa_alias_dts: set,
     qa_embedding: np.ndarray,
     cards: List[Dict[str, Any]],
     card_embeddings: np.ndarray,
     max_cards: int = 3,
+    relevance_weight: float = 0.75,
+    redundancy_weight: float = 0.25,
     allow_global_fallback: bool = ALLOW_GLOBAL_FALLBACK,
 ) -> List[Dict[str, Any]]:
-    """Select top cards by cosine ranking plus bounded tie-break boosts.
+    """Select reasoning cards with exact-DT priority + optional alias + MMR diversity.
 
-    Behavior:
-    - For training context, keep the strongest mechanism cards by score, even
-      when selected cards are semantically close.
-    - Only exact QA DT cards enter the candidate pool.
-    - Cards sharing case-specific words with the QA receive a small bounded
-      lexical boost, which helps avoid generic same-DT relationship cards.
+    Important behavior:
+    - Exact QA DT cards are preferred.
+    - Alias DT cards are added only if fewer than max_cards exact matches exist.
     - Global fallback is disabled by default; fewer relevant cards are better than noisy cards.
     """
     if max_cards <= 0:
         return []
 
-    candidate_indices = []
+    exact_indices = []
+    alias_indices = []
 
     for i, card in enumerate(cards):
         card_dts = get_card_dts(card)
         if card_dts & qa_dts:
-            candidate_indices.append(i)
+            exact_indices.append(i)
+        elif card_dts & qa_alias_dts:
+            alias_indices.append(i)
 
-    if not candidate_indices and allow_global_fallback:
+    if exact_indices:
+        candidate_indices = exact_indices + alias_indices
+    elif alias_indices:
+        candidate_indices = alias_indices
+    elif allow_global_fallback:
         candidate_indices = list(range(len(cards)))
+    else:
+        candidate_indices = []
 
     if not candidate_indices:
         return []
 
-    qa_terms = tokenize_for_overlap(qa_text)
-    scored = []
-    for idx in candidate_indices:
-        card_text = cards[idx].get("core_principle", "")
-        sim = cosine_similarity(qa_embedding, card_embeddings[idx])
-        lexical_boost, overlap_terms = lexical_overlap_boost(qa_terms, card_text)
-        match_type = "global_fallback" if not (get_card_dts(cards[idx]) & qa_dts) else "dt_exact"
-        final_score = sim + lexical_boost
+    relevance = {i: cosine_similarity(qa_embedding, card_embeddings[i]) for i in candidate_indices}
+    selected_indices = []
+    selected_scores = {}
 
-        scored.append((idx, sim, final_score, match_type, lexical_boost, overlap_terms))
+    # MMR selection
+    while len(selected_indices) < max_cards and len(selected_indices) < len(candidate_indices):
+        best_idx = None
+        best_score = -1e9
 
-    scored.sort(key=lambda x: x[2], reverse=True)
+        for idx in candidate_indices:
+            if idx in selected_indices:
+                continue
+
+            if selected_indices:
+                redundancy = max(cosine_similarity(card_embeddings[idx], card_embeddings[j]) for j in selected_indices)
+            else:
+                redundancy = 0.0
+
+            score = relevance_weight * relevance[idx] - redundancy_weight * redundancy
+
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        selected_indices.append(best_idx)
+        selected_scores[best_idx] = best_score
 
     selected = []
-    for idx, sim, final_score, match_type, lexical_boost, overlap_terms in scored[:max_cards]:
+    for idx in selected_indices:
+        if idx in exact_indices:
+            match_type = "dt_exact"
+        elif idx in alias_indices:
+            match_type = "dt_alias"
+        else:
+            match_type = "global_fallback"
+
         selected.append({
             "card": cards[idx],
-            "similarity": sim,
-            "selection_score": final_score,
-            "lexical_boost": lexical_boost,
-            "overlap_terms": overlap_terms,
+            "similarity": relevance[idx],
+            "mmr_score": selected_scores[idx],
             "match_type": match_type,
         })
 
     return selected
 
-def debug_find_gold_card(cards: List[Dict[str, Any]]) -> List[int]:
-    """Print cards containing DEBUG_GOLD_TEXT and return their zero-based indices."""
-    if not DEBUG_GOLD_TEXT:
-        return []
-
-    matches = []
-    print("\n=== DEBUG: GOLD CARD SEARCH ===")
-    for card in cards:
-        text = card.get("core_principle", "")
-        if DEBUG_GOLD_TEXT in text:
-            idx = card.get("_idx")
-            matches.append(idx)
-            print(f"GOLD FOUND: card_{idx}")
-            print(f"  DTs: {sorted(get_card_dts(card))}")
-            print(f"  Text: {text}")
-
-    if not matches:
-        print(f"GOLD NOT FOUND by text: {DEBUG_GOLD_TEXT!r}")
-    print("=== END DEBUG: GOLD CARD SEARCH ===\n")
-    return matches
-
-
-def debug_rank_cards_for_qa(
-    rec_id: str,
-    question: str,
-    qa_text: str,
-    qa_dts: set,
-    qa_embedding: np.ndarray,
-    cards: List[Dict[str, Any]],
-    card_embeddings: np.ndarray,
-    gold_indices: List[int],
-) -> None:
-    """Print exact-DT candidate counts and card ranks before final selection."""
-    if rec_id != DEBUG_QA_ID:
-        return
-
-    candidate_indices = []
-    for i, card in enumerate(cards):
-        card_dts = get_card_dts(card)
-        if card_dts & qa_dts:
-            candidate_indices.append(i)
-
-    exact_candidate_count = len(candidate_indices)
-
-    if candidate_indices:
-        pool_type = "exact"
-    elif ALLOW_GLOBAL_FALLBACK:
-        candidate_indices = list(range(len(cards)))
-        pool_type = "global fallback"
-    else:
-        candidate_indices = []
-        pool_type = "empty"
-
-    qa_terms = tokenize_for_overlap(qa_text)
-    scored = []
-    for idx in candidate_indices:
-        sim = cosine_similarity(qa_embedding, card_embeddings[idx])
-        lexical_boost, overlap_terms = lexical_overlap_boost(
-            qa_terms,
-            cards[idx].get("core_principle", ""),
-        )
-        final_score = sim + lexical_boost
-        scored.append((idx, sim, final_score, lexical_boost, overlap_terms, cards[idx]))
-    scored.sort(key=lambda x: x[2], reverse=True)
-
-    print("\n=== DEBUG: QA CARD RANKING ===")
-    print(f"QA ID: {rec_id}")
-    print(f"QA DTs: {sorted(qa_dts)}")
-    print(f"Question: {question[:220]}")
-    print(f"Pool: {pool_type}")
-    print(f"Exact candidates: {exact_candidate_count}")
-    print(f"Total candidates used: {len(candidate_indices)}")
-
-    for gold_idx in gold_indices:
-        gold_card = cards[gold_idx]
-        in_candidates = gold_idx in candidate_indices
-        rank = next((pos + 1 for pos, (idx, _, _, _, _, _) in enumerate(scored) if idx == gold_idx), None)
-        sim = next((score for idx, score, _, _, _, _ in scored if idx == gold_idx), None)
-        print("\nGold card status:")
-        print(f"  card_{gold_idx}")
-        print(f"  DTs: {sorted(get_card_dts(gold_card))}")
-        print(f"  in_candidates={in_candidates}")
-        print(f"  final_rank={rank}, raw_similarity={None if sim is None else round(float(sim), 4)}")
-
-    print(f"\nTOP {DEBUG_TOP_N} BEFORE FINAL SELECTION:")
-    for rank, (idx, sim, final_score, lexical_boost, overlap_terms, card) in enumerate(scored[:DEBUG_TOP_N], 1):
-        text = card.get("core_principle", "")
-        marker = "  <-- GOLD" if idx in gold_indices else ""
-        print(
-            f"{rank:02d}. card_{idx} sim={sim:.4f} "
-            f"lex={lexical_boost:.4f} score={final_score:.4f} "
-            f"dts={sorted(get_card_dts(card))}{marker}"
-        )
-        if overlap_terms:
-            print(f"    overlap={overlap_terms}")
-        print(f"    {text[:180]}")
-    print("=== END DEBUG: QA CARD RANKING ===\n")
-
-
-def debug_selected_cards(rec_id: str, selected_cards: List[Dict[str, Any]], gold_indices: List[int]) -> None:
-    """Print final cards after raw cosine + exact-DT boost for one debug QA."""
-    if rec_id != DEBUG_QA_ID:
-        return
-
-    print("\n=== DEBUG: FINAL SELECTED CARDS ===")
-    for rank, item in enumerate(selected_cards, 1):
-        card = item["card"]
-        idx = card["_idx"]
-        marker = "  <-- GOLD" if idx in gold_indices else ""
-        print(
-            f"{rank}. card_{idx} "
-            f"match={item.get('match_type')} "
-            f"sim={float(item.get('similarity', 0)):.4f} "
-            f"lex={float(item.get('lexical_boost', 0)):.4f} "
-            f"score={float(item.get('selection_score', 0)):.4f}" + marker
-        )
-        if item.get("overlap_terms"):
-            print(f"   overlap={item.get('overlap_terms')}")
-        print(f"   {card.get('core_principle', '')[:220]}")
-    print("=== END DEBUG: FINAL SELECTED CARDS ===\n")
 
 def format_docs(selected_cards: List[Dict[str, Any]]) -> str:
     """Format selected cards as doc context."""
@@ -421,8 +306,6 @@ def main():
     card_embeddings = embed_model.encode(card_texts, normalize_embeddings=True)
     print(f"  Embedded {len(card_embeddings)} cards")
 
-    gold_indices = debug_find_gold_card(cards)
-
     # Load DT lookup
     dt_lookup = load_dt_lookup(DT_LOOKUP_FILE)
     print(f"  DT lookup: {len(dt_lookup)} records")
@@ -450,9 +333,10 @@ def main():
         if not question or not answer:
             continue
 
-        # Get QA decision types. Preserve original DT for output/debug.
+        # Get QA decision types. Preserve original DT separately from aliases.
         lookup_data = dt_lookup.get(rec_id, {})
         qa_dts = get_record_dts(rec, lookup_data)
+        qa_alias_dts = expand_dt_aliases(qa_dts)
         original_decision_type = get_original_decision_type(rec, lookup_data)
 
         # Embed question + answer, because the mechanism is often explicit in the answer
@@ -462,22 +346,10 @@ def main():
             normalize_embeddings=True
         )
 
-        # Debug raw ranking before final selection
-        debug_rank_cards_for_qa(
-            rec_id=rec_id,
-            question=question,
-            qa_text=qa_text_for_retrieval,
-            qa_dts=qa_dts,
-            qa_embedding=qa_embedding,
-            cards=cards,
-            card_embeddings=card_embeddings,
-            gold_indices=gold_indices,
-        )
-
         # Select cards
         selected = select_cards(
             qa_dts=qa_dts,
-            qa_text=qa_text_for_retrieval,
+            qa_alias_dts=qa_alias_dts,
             qa_embedding=qa_embedding,
             cards=cards,
             card_embeddings=card_embeddings,
@@ -485,10 +357,8 @@ def main():
             allow_global_fallback=ALLOW_GLOBAL_FALLBACK,
         )
 
-        debug_selected_cards(rec_id, selected, gold_indices)
-
         # Track match types
-        has_dt_match = any(s["match_type"] == "dt_exact" for s in selected)
+        has_dt_match = any(s["match_type"] in {"dt_exact", "dt_alias"} for s in selected)
         has_fallback = any(s["match_type"] == "global_fallback" for s in selected)
         if has_dt_match:
             dt_match_count += 1
@@ -509,10 +379,9 @@ def main():
             "doc_ids": [f"card_{s['card']['_idx']}" for s in selected],
             "doc_match_types": [s["match_type"] for s in selected],
             "doc_similarities": [round(float(s["similarity"]), 4) for s in selected],
-            "doc_selection_scores": [round(float(s["selection_score"]), 4) for s in selected],
-            "doc_lexical_boosts": [round(float(s["lexical_boost"]), 4) for s in selected],
             "decision_type": original_decision_type,
             "matching_dts": sorted(qa_dts),
+            "alias_dts": sorted(qa_alias_dts),
         })
 
         if (i + 1) % 50 == 0:

@@ -35,7 +35,7 @@ INPUT_FILES = [
     FINE_TUNING_DIR / "qa_clean.jsonl",
     FINE_TUNING_DIR / "anti_generic_finance.jsonl",
 ]
-CARDS_FILE = FINE_TUNING_DIR / "card_merged.jsonl"
+CARDS_FILE = FINE_TUNING_DIR / "card_principals_deduped_v2_092.jsonl"
 
 # DT lookup from segmented QA (for records without dt_primary)
 DT_LOOKUP_FILE = FINE_TUNING_DIR / "qa_rs_segmented.jsonl"
@@ -44,7 +44,7 @@ DT_LOOKUP_FILE = FINE_TUNING_DIR / "qa_rs_segmented.jsonl"
 OUTPUT_FILE = FINE_TUNING_DIR / "qa_with_rag_context_v2.jsonl"
 
 EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
-MAX_CARDS = 2  # Up to 2 reasoning cards per QA
+MAX_CARDS = 10  # Up to 10 reasoning cards per QA
 
 # DT mapping: QA DT -> Card DT (handle naming mismatches)
 DT_MAPPING = {
@@ -54,8 +54,7 @@ DT_MAPPING = {
 # System prompt template (no book/article or QA example references)
 SYSTEM_PROMPT_TEMPLATE = (
     "You are psychologist Mikhail Labkovsky. Below are reasoning principles.\n\n"
-    "Use these principles as the foundation for your response — "
-    "apply them to the user's situation, but do not copy verbatim.\n\n"
+    "Use these principles as the foundation for your response.\n\n"
     "{docs}\n\n"
     "Answer in Labkovsky's style: blunt, confident, with tough love if needed. "
     "First explain the root cause, then give concrete steps. "
@@ -96,12 +95,17 @@ def load_dt_lookup(path: Path) -> dict:
 
 
 def get_card_dts(card: Dict[str, Any]) -> set:
-    """Get all DTs from a card (primary and secondary)."""
+    """Get all DTs from a card (primary and first secondary only)."""
     dts = set()
     if card.get("dt_primary"):
         dts.add(card["dt_primary"])
-    if card.get("dt_secondary"):
-        dts.add(card["dt_secondary"])
+    # dt_secondary: take first element if array
+    dt_sec = card.get("dt_secondary")
+    if dt_sec:
+        if isinstance(dt_sec, list) and len(dt_sec) > 0:
+            dts.add(dt_sec[0])
+        elif isinstance(dt_sec, str):
+            dts.add(dt_sec)
     return dts
 
 
@@ -179,7 +183,7 @@ def format_docs(selected_cards: List[Dict[str, Any]]) -> str:
     for i, item in enumerate(selected_cards, 1):
         card = item["card"]
         principle = card.get("core_principle", "")
-        parts.append(f"[Reasoning Card] Doc {i}: {principle}")
+        parts.append(f"Doc {i}: {principle}")
     return "\n\n".join(parts)
 
 

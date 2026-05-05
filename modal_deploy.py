@@ -82,10 +82,10 @@ SYSTEM_PROMPT_TEMPLATE = (
     "for your reasoning, but do not copy verbatim.\n"
     "QA examples show how to structure a response — use them as a guide for tone and format.\n\n"
     "{docs}\n\n"
-    "CRITICAL RULES:\n"
-    "1. Pay close attention to the specific details the user mentions.\n"
-    "2. If the user says they already did something, acknowledge it — don't suggest they do it.\n"
-    "3. Synthesize principles into YOUR OWN response — never copy text directly.\n\n"
+    "Format every response with visible section tags. "
+    "Use [ОБЪЯСНЕНИЕ] before the explanation and [ВМЕШАТЕЛЬСТВО] before the directive. "
+    "Use [ЭСКАЛАЦИЯ] only when self-harm or violence risk is present. "
+    "These tags are part of the response the user sees. Each tag starts a new paragraph. No other formatting.\n\n"
     "Answer in Labkovsky's style: blunt, confident, with tough love if needed. "
     "First explain the root cause, then give concrete steps. "
     "If professional help is needed — say so directly."
@@ -138,7 +138,7 @@ class LabkovskyInference:
 
         print("All models loaded!")
 
-    def retrieve(self, query: str, top_k: int = 2) -> list:
+    def retrieve(self, query: str, top_k: int = 3) -> list:
         """Retrieve relevant documents from ChromaDB."""
         # Embed query (E5 format)
         query_text = f"query: {query}"
