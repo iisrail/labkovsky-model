@@ -675,3 +675,246 @@ def test_query():
 # def main():
 #     """Run test queries."""
 #     test_query.remote()
+
+# =============================================================================
+# TELEGRAM BOT (runs on Modal, not on user's laptop)
+# =============================================================================
+#
+# Setup (one time):
+#   modal secret create telegram-bot-token TELEGRAM_BOT_TOKEN=<your_bot_token>
+#
+# Start the bot (detached, runs in Modal's cloud):
+#   modal run --detach modal_deploy_v2.py::run_telegram_bot
+#
+# Stop it via the Modal dashboard or:
+#   modal app stop labkovsky-bot-v2  (stops the whole app)
+
+# Reuse the main image (already has numpy/torch/etc. imported at module top-level)
+# and add the bot-only deps on top.
+bot_image = image.pip_install(
+    "aiogram>=3.0.0",
+    "aiohttp>=3.9.0",
+)
+
+# Public URL of the ask endpoint (this same Modal app)
+MODAL_API_URL = "https://iisrail--labkovsky-bot-v2-ask-labkovsky.modal.run"
+BOT_TEMPERATURE = TEMPERATURE
+BOT_MAX_TOKENS = MAX_NEW_TOKENS
+
+
+@app.function(
+    image=bot_image,
+    secrets=[modal.Secret.from_name("telegram-bot-token")],
+    timeout=86400,  # 24 hours; restart via cron or detach again
+    max_containers=1,  # only one polling consumer
+)
+async def run_telegram_bot():
+    """Long-running aiogram polling loop, hosted on Modal (no local laptop needed)."""
+    import asyncio
+    import logging
+    import os
+
+    import aiohttp
+    from aiogram import Bot, Dispatcher, F
+    from aiogram.types import Message
+    from aiogram.filters import CommandStart, Command
+    from aiogram.enums import ParseMode
+    from aiogram.utils.markdown import hbold, hcode
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    log = logging.getLogger("labkovsky-bot")
+
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN missing — create the secret with:\n"
+            "  modal secret create telegram-bot-token TELEGRAM_BOT_TOKEN=<token>"
+        )
+
+    bot = Bot(token=token)
+    dp = Dispatcher()
+
+    async def call_modal_api(question: str) -> dict:
+        params = {
+            "question": question,
+            "temperature": BOT_TEMPERATURE,
+            "max_tokens": BOT_MAX_TOKENS,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                MODAL_API_URL,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                text = await response.text()
+                log.error("API error: %s %s", response.status, text)
+                return {"answer": "Извините, сервис временно недоступен."}
+
+    def _format_cards_log(cards: list) -> str:
+        if not cards:
+            return "[]"
+        return "[" + ", ".join(f"{c['id']}@{c['sim']:.3f}" for c in cards) + "]"
+
+    def _format_debug_report(result: dict) -> str:
+        lines = []
+        lines.append(hbold("RAG Debug Trace"))
+        lines.append(f"{hbold('Question:')} {result.get('question', '')}")
+        lines.append("")
+        lines.append(f"{hbold('decision_type:')} {hcode(result.get('decision_type'))}")
+        lines.append(f"{hbold('dt_source:')} {hcode(result.get('dt_source'))}")
+        nearest_id = result.get("nearest_qa_id")
+        nearest_sim = result.get("nearest_qa_similarity")
+        if nearest_id is not None:
+            sim_str = f"{nearest_sim:.4f}" if isinstance(nearest_sim, (int, float)) else "n/a"
+            lines.append(f"{hbold('nearest_qa:')} {hcode(nearest_id)} sim={sim_str}")
+        vscore = result.get("violence_score")
+        if isinstance(vscore, (int, float)):
+            flag = "TRUE" if result.get("is_violence") else "false"
+            lines.append(f"{hbold('violence:')} {flag} (score={vscore:.4f})")
+        gate = result.get("topic_gate") or {}
+        if gate:
+            passed = "PASS" if gate.get("passed") else "BLOCK"
+            lines.append(
+                f"{hbold('topic_gate:')} {passed} "
+                f"top_sim={gate.get('top_sim')} floor={gate.get('threshold')}"
+            )
+
+        lines.append("")
+        cards = result.get("cards") or []
+        lines.append(f"{hbold(f'Cards ({len(cards)}):')}")
+        for i, c in enumerate(cards, 1):
+            dt_str = ",".join(c.get("dt", [])) if c.get("dt") else "-"
+            lines.append(
+                f"  {i}. {hcode(c['id'])} dt={dt_str} sim={c['sim']:.4f} "
+                f"score={c['score']:.4f} lex={c['lex_boost']:.4f} ({c['match_type']})"
+            )
+            preview = c.get("principle_preview", "")
+            if preview:
+                lines.append(f"     <i>{preview}</i>")
+
+        qa = result.get("qa_example")
+        lines.append("")
+        lines.append(hbold("QA example:"))
+        if qa:
+            lines.append(f"  {hcode(qa['id'])} dt={qa['dt']} sim={qa['sim']:.4f}")
+            if qa.get("question_preview"):
+                lines.append(f"  <i>{qa['question_preview']}</i>")
+        else:
+            lines.append("  (none)")
+
+        lines.append("")
+        answer = result.get("answer", "")
+        if len(answer) > 1500:
+            answer = answer[:1500] + "..."
+        lines.append(hbold("Answer:"))
+        lines.append(answer)
+
+        return "\n".join(lines)
+
+    @dp.message(CommandStart())
+    async def handle_start(message: Message):
+        await message.answer(
+            "Здравствуйте! Я AI-психолог в стиле Михаила Лабковского.\n\n"
+            "Задайте мне вопрос о психологии, отношениях или личных проблемах, "
+            "и я постараюсь помочь.\n\n"
+            "Команды:\n"
+            "/help — справка\n"
+            "/debug <вопрос> — показать RAG-трассу"
+        )
+
+    @dp.message(Command("help"))
+    async def handle_help(message: Message):
+        await message.answer(
+            "Команды:\n"
+            "/start — приветствие\n"
+            "/debug <вопрос> — вернёт ответ вместе с трассой RAG: "
+            "decision_type, ближайший QA, 3 карточки с их similarity и фрагментами принципов.\n\n"
+            "Пример: /debug Почему я не могу уйти от мужа?"
+        )
+
+    @dp.message(Command("debug"))
+    async def handle_debug(message: Message):
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer(
+                "Использование: /debug <вопрос>\nПример: /debug Почему я не могу уйти от мужа?"
+            )
+            return
+
+        question = parts[1].strip()
+        log.info("DEBUG question from %s: %s...", message.from_user.id, question[:50])
+        await message.bot.send_chat_action(message.chat.id, "typing")
+
+        try:
+            result = await call_modal_api(question)
+            result.setdefault("question", question)
+            report = _format_debug_report(result)
+            if len(report) > 4000:
+                report = report[:3990] + "\n…"
+            await message.answer(report, parse_mode=ParseMode.HTML)
+            cards = result.get("cards") or []
+            log.info(
+                "DEBUG answered %s dt=%s cards=%s qa=%s",
+                message.from_user.id,
+                result.get("decision_type"),
+                _format_cards_log(cards),
+                (result.get("qa_example") or {}).get("id"),
+            )
+        except asyncio.TimeoutError:
+            log.error("API timeout")
+            await message.answer("Сервис загружается, попробуйте ещё раз через минуту.")
+        except Exception as e:
+            log.error("Error: %s", e)
+            await message.answer("Ошибка при обработке /debug.")
+
+    @dp.message(F.text)
+    async def handle_question(message: Message):
+        question = (message.text or "").strip()
+        if not question:
+            return
+
+        log.info("Question from %s: %s...", message.from_user.id, question[:50])
+        await message.bot.send_chat_action(message.chat.id, "typing")
+
+        try:
+            result = await call_modal_api(question)
+            answer = result.get("answer", "Извините, не удалось получить ответ.")
+            if len(answer) > 4000:
+                answer = answer[:4000] + "..."
+            await message.answer(answer)
+
+            cards = result.get("cards") or []
+            qa = result.get("qa_example") or {}
+            log.info(
+                "Answered %s (%d chars) dt=%s src=%s violence=%s score=%.3f cards=%s qa=%s",
+                message.from_user.id,
+                len(answer),
+                result.get("decision_type"),
+                result.get("dt_source"),
+                result.get("is_violence"),
+                float(result.get("violence_score", 0.0)),
+                _format_cards_log(cards),
+                qa.get("id"),
+            )
+        except asyncio.TimeoutError:
+            log.error("API timeout")
+            await message.answer(
+                "Извините, сервис загружается. Попробуйте ещё раз через минуту."
+            )
+        except Exception as e:
+            log.error("Error: %s", e)
+            await message.answer("Извините, произошла ошибка при обработке вопроса.")
+
+    log.info("=" * 50)
+    log.info("Labkovsky Telegram Bot (Modal-hosted)")
+    log.info("=" * 50)
+    log.info("API: %s", MODAL_API_URL)
+
+    await dp.start_polling(bot)
