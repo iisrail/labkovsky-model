@@ -26,3 +26,12 @@ Thumbs.db
 .env
 .env.local
 *.env
+
+# WSL virtualenv
+venv_wsl/
+
+# Claude Code session state
+.claude/
+
+# Unsloth/Triton compiled kernels
+unsloth_compiled_cache/
